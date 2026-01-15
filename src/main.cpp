@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <format>
+#include <fstream>
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
@@ -33,6 +34,43 @@ int extract_images() {
     return 0;
 }
 
+void saveTrajectoryToPLY(const std::vector<cv::Mat>& poses, const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "Could not open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    out << "ply\n";
+    out << "format ascii 1.0\n";
+    out << "element vertex " << poses.size() << "\n";
+    out << "property float x\n";
+    out << "property float y\n";
+    out << "property float z\n";
+    out << "property uchar red\n";
+    out << "property uchar green\n";
+    out << "property uchar blue\n";
+    out << "end_header\n";
+
+    for (size_t i = 0; i < poses.size(); ++i) {
+        cv::Mat R = poses[i](cv::Rect(0, 0, 3, 3));
+        cv::Mat t = poses[i](cv::Rect(3, 0, 1, 3));
+        
+        // Camera center in world coordinates: C = -R^T * t
+        cv::Mat C = -R.t() * t;
+        
+        // Color gradient from red (start) to blue (end)
+        int r = static_cast<int>(255 * (1.0 - static_cast<double>(i) / std::max(1UL, poses.size() - 1)));
+        int b = static_cast<int>(255 * (static_cast<double>(i) / std::max(1UL, poses.size() - 1)));
+        int g = 0;
+
+        out << C.at<double>(0) << " " << C.at<double>(1) << " " << C.at<double>(2) << " "
+            << r << " " << g << " " << b << "\n";
+    }
+    out.close();
+    std::cout << "Trajectory saved to " << filename << std::endl;
+}
+
 int loop_closing() {
     std::string video_path = "data/IMG_0243.MOV";
     if (!fs::exists(video_path)) {
@@ -42,6 +80,10 @@ int loop_closing() {
     std::string output_dir = "data/loop_closing_results";
     if (!fs::exists("data") && fs::exists("../data")) {
         output_dir = "../data/loop_closing_results";
+    }
+
+    if (!fs::exists(output_dir)) {
+        fs::create_directories(output_dir);
     }
 
     // Get the total number of frames
@@ -66,6 +108,11 @@ int loop_closing() {
     cv::Ptr<cv::ORB> orb = cv::ORB::create();
     cv::BFMatcher matcher(cv::NORM_HAMMING); // Use Hamming distance
     std::vector<cv::DMatch> matches;
+
+    // Track trajectory
+    cv::Mat T_total = cv::Mat::eye(4, 4, CV_64F);
+    std::vector<cv::Mat> all_poses;
+    all_poses.push_back(T_total.clone());
 
     // Run first frame
     std::string first_frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", current_frame_index) + ".png";
@@ -117,10 +164,25 @@ int loop_closing() {
         cv::Mat R, t;
         cv::recoverPose(essential_matrix, pts1, pts2, R, t, focal, pp, mask);
 
-        
+        // 4. Accumulate pose
+        // recoverPose returns R and t such that x_curr = R * x_prev + t
+        // T_rel is the transformation from frame i-1 to frame i
+        cv::Mat T_rel = cv::Mat::eye(4, 4, CV_64F);
+        cv::Mat R_64, t_64;
+        R.convertTo(R_64, CV_64F);
+        t.convertTo(t_64, CV_64F);
+        R_64.copyTo(T_rel(cv::Rect(0, 0, 3, 3)));
+        t_64.copyTo(T_rel(cv::Rect(3, 0, 1, 3)));
+
+        // T_total_i = T_rel * T_total_{i-1}
+        T_total = T_rel * T_total;
+        all_poses.push_back(T_total.clone());
 
         current_frame_index++;
     }
+
+    // Save the trajectory
+    saveTrajectoryToPLY(all_poses, output_dir + "/trajectory.ply");
 
     return 0;
 }
