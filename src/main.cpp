@@ -34,6 +34,15 @@ int extract_images() {
     return 0;
 }
 
+int readFrame(const std::string& frame_path, cv::Mat& frame) {
+    frame = cv::imread(frame_path);
+    if (frame.empty()) {
+        std::cerr << "Could not read frame: " << frame_path << std::endl;
+        return -1;
+    }
+    return 0;
+}
+
 void saveTrajectoryToPLY(const std::vector<cv::Mat>& poses, const std::string& filename) {
     std::ofstream out(filename);
     if (!out.is_open()) {
@@ -86,7 +95,7 @@ int loop_closing() {
         fs::create_directories(output_dir);
     }
 
-    // Get the total number of frames
+    // Find the extracted frames directory
     std::string extracted_frames_dir = "data/extracted_frames";
     if (!fs::exists(extracted_frames_dir)) {
         extracted_frames_dir = "../data/extracted_frames";
@@ -114,14 +123,98 @@ int loop_closing() {
     std::vector<cv::Mat> all_poses;
     all_poses.push_back(T_total.clone());
 
-    // Run first frame
+    // --------------------------------------------------------------------------------------------------
+    // Initialization (frame 0 & 1)
+
+    // Camera matrix
+    double focal = 712.8;
+    cv::Point2d pp(540, 960); // assuming the principal point is at the center of the image
+    cv::Mat K = (cv::Mat_<double>(3, 3) << focal, 0, pp.x, 0, focal, pp.y, 0, 0, 1);
+
+    // Get first two frames
     std::string first_frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", current_frame_index) + ".png";
-    current_frame = cv::imread(first_frame_path);
-    if (current_frame.empty()) {
-        std::cerr << "Could not read first frame: " << first_frame_path << std::endl;
-        return -1;
-    }
+    readFrame(first_frame_path, previous_frame);
+    current_frame_index++;
+    std::string second_frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", current_frame_index) + ".png";
+    readFrame(second_frame_path, current_frame);
+
+    // Detect features
+    orb->detectAndCompute(previous_frame, cv::noArray(), previous_features, previous_descriptors);
     orb->detectAndCompute(current_frame, cv::noArray(), current_features, current_descriptors);
+
+    // Match features
+    matcher.match(previous_descriptors, current_descriptors, matches);
+    std::cout << "Matches between frame 0 and 1: " << matches.size() << std::endl;
+
+    // Filter matches (simple distance-based filter)
+    std::sort(matches.begin(), matches.end());
+    if (matches.size() > 500) matches.erase(matches.begin() + 500, matches.end());
+
+    // 1. Convert KeyPoints to Points
+    std::vector<cv::Point2f> pts1, pts2;
+    for (const auto& m : matches) {
+        pts1.push_back(previous_features[m.queryIdx].pt);
+        pts2.push_back(current_features[m.trainIdx].pt);
+    }
+
+    // 2. Find essential matrix
+    cv::Mat mask;
+    cv::Mat essential_matrix = cv::findEssentialMat(pts1, pts2, K, cv::RANSAC, 0.999, 1.0, mask);
+
+    // 3. Recover pose
+    cv::Mat R, t;
+    cv::recoverPose(essential_matrix, pts1, pts2, K, R, t, mask);
+
+    cv::Mat R_t = R.t();
+
+    // 4. Triangulate
+    // Projection matrices
+    cv::Mat P1 = K * cv::Mat::eye(3, 4, CV_64F);
+    cv::Mat Rt;
+    cv::hconcat(R_t, -R_t * t, Rt);
+    cv::Mat P2 = K * Rt;
+
+    cv::Mat points4D;
+    cv::triangulatePoints(P1, P2, pts1, pts2, points4D);
+
+    // Convert to 3D points and store them
+    std::vector<cv::Point3f> world_points;
+    std::vector<cv::Point2f> tracked_2d_points;
+    cv::Mat tracked_descriptors;
+
+    for (int i = 0; i < points4D.cols; i++) {
+        float w = points4D.at<float>(3, i);
+        if (std::abs(w) > 1e-6) {
+            cv::Point3f p(points4D.at<float>(0, i) / w,
+                          points4D.at<float>(1, i) / w,
+                          points4D.at<float>(2, i) / w);
+            
+            // Check if point is in front of both cameras
+            if (p.z > 0) {
+                // Transform to second camera frame to check depth there too
+                cv::Mat p_cam2 = R_t * (cv::Mat_<double>(3,1) << p.x, p.y, p.z) - R_t * t;
+                if (p_cam2.at<double>(2) > 0) {
+                    world_points.push_back(p);
+                    tracked_2d_points.push_back(pts2[i]);
+                    tracked_descriptors.push_back(current_descriptors.row(matches[i].trainIdx));
+                }
+            }
+        }
+    }
+
+    std::cout << "Initial triangulation: " << world_points.size() << " points" << std::endl;
+
+    // Update T_total for frame 1
+    // T_total currently is Frame 0 (Identity)
+    // T_1_w = [R.t() | -R.t()*t]
+    cv::Mat T1 = cv::Mat::eye(4, 4, CV_64F);
+    R_t.copyTo(T1(cv::Rect(0, 0, 3, 3)));
+    cv::Mat t_world = -R_t * t;
+    t_world.copyTo(T1(cv::Rect(3, 0, 1, 3)));
+    
+    T_total = T1;
+    all_poses.push_back(T_total.clone());
+
     current_frame_index++;
 
     // Loop over remaining frames
