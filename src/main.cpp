@@ -234,42 +234,85 @@ int loop_closing() {
         // Detect and compute features
         orb->detectAndCompute(current_frame, cv::noArray(), current_features, current_descriptors);
 
-        // Match features
-        matcher.match(previous_descriptors, current_descriptors, matches);
+        // --- STEP 3: TRACKING (Map-to-Frame) ---
+        // Match descriptors of existing 3D points against current frame
+        std::vector<cv::DMatch> map_matches;
+        matcher.match(tracked_descriptors, current_descriptors, map_matches);
         
-        std::cout << "Frame " << current_frame_index << " - Matches: " << matches.size() << std::endl;
-
-        // Triangulation
-        // 1. Convert KeyPoints to Points
-        std::vector<cv::Point2f> pts1, pts2;
-        for (const auto& m : matches) {
-            pts1.push_back(previous_features[m.queryIdx].pt);
-            pts2.push_back(current_features[m.trainIdx].pt);
+        std::vector<cv::Point3f> pnp_world_points;
+        std::vector<cv::Point2f> pnp_image_points;
+        for (const auto& m : map_matches) {
+            pnp_world_points.push_back(world_points[m.queryIdx]);
+            pnp_image_points.push_back(current_features[m.trainIdx].pt);
         }
 
-        // 2. Find essential matrix with correct intrinsics
-        double focal = 712.8;
-        cv::Point2d pp(540, 960); // assuming the principal point is at the center of the image
-        cv::Mat mask;
-        cv::Mat essential_matrix = cv::findEssentialMat(pts1, pts2, focal, pp, cv::RANSAC, 0.999, 1.0, mask);
+        if (pnp_world_points.size() < 10) {
+            std::cerr << "Tracking lost at frame " << current_frame_index << std::endl;
+            break;
+        }
 
-        // 3. Recover pose
-        cv::Mat R, t;
-        cv::recoverPose(essential_matrix, pts1, pts2, R, t, focal, pp, mask);
+        // Recover current pose [R|t] relative to world
+        cv::Mat rvec, t_pnp;
+        cv::solvePnPRansac(pnp_world_points, pnp_image_points, K, cv::Mat(), rvec, t_pnp);
+        cv::Mat R_curr;
+        cv::Rodrigues(rvec, R_curr);
 
-        // 4. Accumulate pose
-        // recoverPose returns R and t such that x_curr = R * x_prev + t
-        // T_rel is the transformation from frame i-1 to frame i
-        cv::Mat T_rel = cv::Mat::eye(4, 4, CV_64F);
-        cv::Mat R_64, t_64;
-        R.convertTo(R_64, CV_64F);
-        t.convertTo(t_64, CV_64F);
-        R_64.copyTo(T_rel(cv::Rect(0, 0, 3, 3)));
-        t_64.copyTo(T_rel(cv::Rect(3, 0, 1, 3)));
-
-        // T_total_i = T_rel * T_total_{i-1}
-        T_total = T_rel * T_total;
+        // Update T_total (Camera-to-World)
+        cv::Mat T_curr = cv::Mat::eye(4, 4, CV_64F);
+        cv::Mat R_w = R_curr.t();
+        cv::Mat t_w = -R_curr.t() * t_pnp;
+        R_w.copyTo(T_curr(cv::Rect(0, 0, 3, 3)));
+        t_w.copyTo(T_curr(cv::Rect(3, 0, 1, 3)));
+        T_total = T_curr;
         all_poses.push_back(T_total.clone());
+
+        // --- STEP 4: TRIANGULATION (Map Extension) ---
+        // 1. Match previous frame to current frame to find potential new points
+        std::vector<cv::DMatch> frame_matches;
+        matcher.match(previous_descriptors, current_descriptors, frame_matches);
+
+        // 2. Get projection matrices
+        // P = K * [R_world_to_cam | t_world_to_cam]
+        cv::Mat T_prev_inv = all_poses[all_poses.size() - 2].inv();
+        cv::Mat P_prev = K * T_prev_inv(cv::Rect(0, 0, 4, 3));
+        
+        cv::Mat T_curr_inv = T_total.inv();
+        cv::Mat P_curr = K * T_curr_inv(cv::Rect(0, 0, 4, 3));
+
+        std::vector<cv::Point2f> pts_prev, pts_curr;
+        for (const auto& m : frame_matches) {
+            pts_prev.push_back(previous_features[m.queryIdx].pt);
+            pts_curr.push_back(current_features[m.trainIdx].pt);
+        }
+
+        cv::Mat points4D;
+        cv::triangulatePoints(P_prev, P_curr, pts_prev, pts_curr, points4D);
+
+        // 3. Add new valid points to the map
+        tracked_descriptors.release(); // We will rebuild this
+        std::vector<cv::Point3f> new_world_points;
+        cv::Mat new_tracked_descriptors;
+
+        for (int i = 0; i < points4D.cols; i++) {
+            float w = points4D.at<float>(3, i);
+            if (std::abs(w) > 1e-6) {
+                cv::Point3f p(points4D.at<float>(0, i)/w, points4D.at<float>(1, i)/w, points4D.at<float>(2, i)/w);
+                
+                // Basic filtering: point must be in front of camera and not too far
+                cv::Mat p_local = R_curr * (cv::Mat_<double>(3,1) << p.x, p.y, p.z) + t_pnp;
+                if (p_local.at<double>(2) > 0 && p_local.at<double>(2) < 50.0) {
+                    new_world_points.push_back(p);
+                    new_tracked_descriptors.push_back(current_descriptors.row(frame_matches[i].trainIdx));
+                }
+            }
+        }
+        
+        // Update the map for the next frame
+        world_points = new_world_points;
+        tracked_descriptors = new_tracked_descriptors;
+
+        std::cout << "Frame " << current_frame_index << " - PnP Inliers: " << pnp_world_points.size() 
+                    << " - Map Size: " << world_points.size() << std::endl;
 
         current_frame_index++;
     }
