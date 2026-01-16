@@ -82,7 +82,7 @@ void saveTrajectoryToPLY(const std::vector<cv::Mat>& poses, const std::string& f
 
     for (size_t i = 0; i < centers.size(); ++i) {
         // Subtract mean to center at 0,0,0
-        cv::Mat C_centered = centers[i] - mean_center;
+        cv::Mat C_centered = centers[i]; // - mean_center;
         
         // Color gradient from red (start) to blue (end)
         int r = static_cast<int>(255 * (1.0 - static_cast<double>(i) / std::max(1UL, poses.size() - 1)));
@@ -331,9 +331,10 @@ int loop_closing() {
         cv::triangulatePoints(P_prev, P_curr, pts_prev, pts_curr, loop_points4D);
 
         // add new valid points to the map
-        std::vector<cv::Point3f> new_world_points; 
-        cv::Mat new_tracked_descriptors; 
+        // std::vector<cv::Point3f> new_world_points; 
+        // cv::Mat new_tracked_descriptors; 
 
+        int new_points_count = 0;
         for (int j = 0; j < loop_points4D.cols; j++) { 
             float w = loop_points4D.at<float>(3, j);
             if (std::abs(w) > 1e-6) {
@@ -342,18 +343,21 @@ int loop_closing() {
                 // transform to current camera frame to check depth
                 cv::Mat p_local = R_curr * (cv::Mat_<double>(3,1) << p.x, p.y, p.z) + t_pnp;
                 if (p_local.at<double>(2) > 0 && p_local.at<double>(2) < 50.0) {
-                    new_world_points.push_back(p);
-                    new_tracked_descriptors.push_back(frame_descriptors[i].row(frame_matches[j].trainIdx));
+                    // Check if this point is far enough from existing points (simple duplicate check)
+                    // For now, just add it to keep tracking robust
+                    world_points.push_back(p);
+                    tracked_descriptors.push_back(frame_descriptors[i].row(frame_matches[j].trainIdx));
+                    new_points_count++;
                 }
             }
         }
         
-        // update the map for the next frame
-        world_points = new_world_points;
-        tracked_descriptors = new_tracked_descriptors;
+        // No longer overwriting!
+        // world_points = new_world_points;
+        // tracked_descriptors = new_tracked_descriptors;
 
         std::cout << "Frame " << i * SKIP_FRAMES << " - PnP Inliers: " << inliers.rows 
-                    << " - Map Size: " << world_points.size() << std::endl;
+                    << " - Map Size: " << world_points.size() << " (Added " << new_points_count << ")" << std::endl;
     }
 
     // Save the trajectory

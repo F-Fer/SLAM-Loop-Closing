@@ -27,4 +27,7 @@ add_executable(LoopClosing ${LOOP_CLOSING_SOURCES})
 add_executable(calibrate src/calibrate.cpp)
 target_link_libraries(calibrate ${OpenCV_LIBS})
 
+add_executable(main2 src/main2.cpp)
+target_link_libraries(main2 ${OpenCV_LIBS})
+
 target_link_libraries(LoopClosing ${OpenCV_LIBS})
