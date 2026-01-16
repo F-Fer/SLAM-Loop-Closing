@@ -15,9 +15,16 @@ find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(include)
 
-# wildcard
-file(GLOB SOURCES "src/*.cpp")
+# Source files for the main project (excluding calibration)
+set(LOOP_CLOSING_SOURCES 
+    src/main.cpp 
+    src/extract_images_from_mov.cpp
+)
 
-add_executable(LoopClosing ${SOURCES})
+add_executable(LoopClosing ${LOOP_CLOSING_SOURCES})
+
+# Separate executable for calibration
+add_executable(calibrate src/calibrate.cpp)
+target_link_libraries(calibrate ${OpenCV_LIBS})
 
 target_link_libraries(LoopClosing ${OpenCV_LIBS})

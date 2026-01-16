@@ -12,7 +12,7 @@
 
 namespace fs = std::filesystem;
 
-int SKIP_FRAMES = 3;
+int SKIP_FRAMES = 20;
 
 int extract_images() {
     std::string video_path = "data/IMG_0243.MOV";
@@ -335,7 +335,10 @@ int loop_closing() {
     }
 
     // Save the trajectory
-    saveTrajectoryToPLY(all_poses, output_dir + "/trajectory.ply");
+    // Save filename with timestamp
+    std::string timestamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    std::string file_name = output_dir + "/trajectory_" + timestamp + ".ply";
+    saveTrajectoryToPLY(all_poses, file_name);
 
     return 0;
 }
