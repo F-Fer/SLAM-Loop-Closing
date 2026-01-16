@@ -12,7 +12,7 @@
 
 namespace fs = std::filesystem;
 
-int SKIP_FRAMES = 3;
+int SKIP_FRAMES = 5;
 
 int extract_images() {
     std::string video_path = "data/IMG_0243.MOV";
@@ -111,6 +111,17 @@ int loop_closing() {
         fs::create_directories(output_dir);
     }
 
+    // Camera intrinsics + distortion from chessboard calibration
+    const double fx = 2278.314580683383;
+    const double fy = 2285.883046238368;
+    const double cx = 2165.251737468604;
+    const double cy = 2802.513071510824;
+    cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+    cv::Mat distCoeffs = (cv::Mat_<double>(1, 5)
+        << 0.02048298766857351, -0.02612160068548943,
+           -0.002871001624427744, 0.005322895660974928,
+           0.04897595392479197);
+
     // Find the extracted frames directory
     std::string extracted_frames_dir = "data/extracted_frames";
     if (!fs::exists(extracted_frames_dir)) {
@@ -124,7 +135,7 @@ int loop_closing() {
     // --------------------------------------------------------------------------------------------------
     // 1. heavy lifting: extract all frames and their features
 
-    // Extract all frames into a vector
+    // Extract all frames into a vector (undistorted)
     std::vector<cv::Mat> frames;
     int total_processed_frames = 0;
     for (int i = 0; ; i += SKIP_FRAMES) {
@@ -133,7 +144,9 @@ int loop_closing() {
         
         cv::Mat frame;
         if (readFrame(frame_path, frame) == 0) {
-            frames.push_back(frame);
+            cv::Mat undistorted;
+            cv::undistort(frame, undistorted, K, distCoeffs);
+            frames.push_back(undistorted);
         }
         total_processed_frames = i + SKIP_FRAMES;
     }
@@ -160,22 +173,25 @@ int loop_closing() {
     // --------------------------------------------------------------------------------------------------
     // Initialization (frame 0 & 1)
 
-    // Camera matrix from chessboard calibration
-    const double fx = 2278.314580683383;
-    const double fy = 2285.883046238368;
-    const double cx = 2165.251737468604;
-    const double cy = 2802.513071510824;
-    cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+    auto ratioFilter = [](const std::vector<std::vector<cv::DMatch>>& knn_matches,
+                          std::vector<cv::DMatch>& good_matches,
+                          float ratio = 0.75f) {
+        good_matches.clear();
+        for (const auto& m : knn_matches) {
+            if (m.size() < 2) continue;
+            if (m[0].distance < ratio * m[1].distance) {
+                good_matches.push_back(m[0]);
+            }
+        }
+    };
 
     // Match features between frame 0 and 1
     cv::BFMatcher matcher(cv::NORM_HAMMING); // Use Hamming distance
+    std::vector<std::vector<cv::DMatch>> init_knn;
     std::vector<cv::DMatch> init_matches;
-    matcher.match(frame_descriptors[0], frame_descriptors[1], init_matches);
+    matcher.knnMatch(frame_descriptors[0], frame_descriptors[1], init_knn, 2);
+    ratioFilter(init_knn, init_matches);
     std::cout << "Matches between frame 0 and 1: " << init_matches.size() << std::endl;
-
-    // Filter matches (simple distance-based filter)
-    std::sort(init_matches.begin(), init_matches.end()); // sort matches by distance
-    if (init_matches.size() > 500) init_matches.erase(init_matches.begin() + 500, init_matches.end()); // keep only the best 500 matches
 
     // convert KeyPoints to Points
     std::vector<cv::Point2f> pts1, pts2;
@@ -260,8 +276,10 @@ int loop_closing() {
     // Loop over remaining frames
     for (int i = 2; i < frames.size(); i++) {
         // Match descriptors of existing 3D points against current frame
+        std::vector<std::vector<cv::DMatch>> map_knn;
         std::vector<cv::DMatch> map_matches;
-        matcher.match(tracked_descriptors, frame_descriptors[i], map_matches);
+        matcher.knnMatch(tracked_descriptors, frame_descriptors[i], map_knn, 2);
+        ratioFilter(map_knn, map_matches);
         
         std::vector<cv::Point3f> pnp_world_points; 
         std::vector<cv::Point2f> pnp_image_points; 
@@ -291,8 +309,10 @@ int loop_closing() {
         all_poses.push_back(T_total.clone());
 
         // match previous frame to current frame to find potential new points
+        std::vector<std::vector<cv::DMatch>> frame_knn;
         std::vector<cv::DMatch> frame_matches;
-        matcher.match(frame_descriptors[i-1], frame_descriptors[i], frame_matches);
+        matcher.knnMatch(frame_descriptors[i-1], frame_descriptors[i], frame_knn, 2);
+        ratioFilter(frame_knn, frame_matches);
 
         // get projection matrices (World-to-Camera)
         cv::Mat T_prev_inv = all_poses[all_poses.size() - 2].inv(); 
