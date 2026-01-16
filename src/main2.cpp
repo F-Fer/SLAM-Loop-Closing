@@ -19,13 +19,17 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
-
+#include <chrono>
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
+
+namespace fs = std::filesystem;
+
+int SKIP_FRAMES = 10;
 
 struct CameraPose
 {
@@ -634,16 +638,28 @@ int main(int argc, char** argv)
 {
     try
     {
-        std::vector<std::string> argv = 
-            { 
-                "../../data/motion/IMG_9502.jpeg", 
-                "../../data/motion/IMG_9503.jpeg",
-                "../../data/motion/IMG_9504.jpeg",
-                "../../data/motion/IMG_9505.jpeg",
-                "../../data/motion/IMG_9506.jpeg",
-            };
+        // Find the extracted frames directory
+        std::string extracted_frames_dir = "data/extracted_frames";
+        if (!fs::exists(extracted_frames_dir)) {
+            extracted_frames_dir = "../data/extracted_frames";
+            if (!fs::exists(extracted_frames_dir)) {
+                std::cerr << "Could not find extracted frames directory: " << extracted_frames_dir << std::endl;
+                return -1;
+            }
+        }
 
-        argc = 5;
+        // find all frames and save the frame paths to a vector
+        std::vector<std::string> argv;
+        for (int i = 0; ; i += SKIP_FRAMES) {
+            std::string frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", i) + ".png";
+            if (!fs::exists(frame_path)) break;
+            
+            argv.push_back(frame_path);
+        }
+
+        argc = argv.size();
+
+        std::cout << "Loaded " << argc << " frames." << std::endl;
 
         // --- 1. Camera intrinsics (K) ----------------------------------------
         //
@@ -752,6 +768,14 @@ int main(int argc, char** argv)
             //   X_{i+1} = R * (R_i X_w + t_i) + t = (R R_i) X_w + (R t_i + t)
             //
             // => R_{i+1} = R * R_i, t_{i+1} = R * t_i + t
+
+            // If previous pose was not computed (e.g. tracking failure), reset to identity
+            if (poses[i].R.empty()) {
+                std::cout << "  [WARNING] Previous pose (camera " << i << ") invalid. Resetting to Identity." << std::endl;
+                poses[i].R = cv::Mat::eye(3, 3, CV_64F);
+                poses[i].t = cv::Mat::zeros(3, 1, CV_64F);
+            }
+
             poses[i+1].R = R * poses[i].R;
             poses[i+1].t = R * poses[i].t + t;
 
@@ -852,7 +876,10 @@ int main(int argc, char** argv)
         
         // --- 8. Save to OBJ --------------------------------------------------
 
-        saveAsOBJ("reconstructionBundle.obj", all3DPoints, poses);
+        // Save with timestamp
+        std::string timestamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        std::string file_name = "../data/reconstruction/reconstructionBundle_" + timestamp + ".obj";
+        saveAsOBJ(file_name, all3DPoints, poses);
         
         return EXIT_SUCCESS;
     }
