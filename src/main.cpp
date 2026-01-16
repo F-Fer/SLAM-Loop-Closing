@@ -63,23 +63,34 @@ void saveTrajectoryToPLY(const std::vector<cv::Mat>& poses, const std::string& f
     out << "property uchar blue\n";
     out << "end_header\n";
 
-    for (size_t i = 0; i < poses.size(); ++i) {
-        cv::Mat R = poses[i](cv::Rect(0, 0, 3, 3));
-        cv::Mat t = poses[i](cv::Rect(3, 0, 1, 3));
-        
-        // Camera center in world coordinates: C = -R^T * t
+    // Calculate all camera centers first to find the centroid
+    std::vector<cv::Mat> centers;
+    cv::Mat mean_center = cv::Mat::zeros(3, 1, CV_64F);
+    for (const auto& pose : poses) {
+        cv::Mat R = pose(cv::Rect(0, 0, 3, 3));
+        cv::Mat t = pose(cv::Rect(3, 0, 1, 3));
         cv::Mat C = -R.t() * t;
+        centers.push_back(C.clone());
+        mean_center += C;
+    }
+    if (!poses.empty()) {
+        mean_center /= static_cast<double>(poses.size());
+    }
+
+    for (size_t i = 0; i < centers.size(); ++i) {
+        // Subtract mean to center at 0,0,0
+        cv::Mat C_centered = centers[i] - mean_center;
         
         // Color gradient from red (start) to blue (end)
         int r = static_cast<int>(255 * (1.0 - static_cast<double>(i) / std::max(1UL, poses.size() - 1)));
         int b = static_cast<int>(255 * (static_cast<double>(i) / std::max(1UL, poses.size() - 1)));
         int g = 0;
 
-        out << C.at<double>(0) << " " << C.at<double>(1) << " " << C.at<double>(2) << " "
+        out << C_centered.at<double>(0) << " " << C_centered.at<double>(1) << " " << C_centered.at<double>(2) << " "
             << r << " " << g << " " << b << "\n";
     }
     out.close();
-    std::cout << "Trajectory saved to " << filename << std::endl;
+    std::cout << "Trajectory centered and saved to " << filename << std::endl;
 }
 
 int loop_closing() {
