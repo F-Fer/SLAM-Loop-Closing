@@ -12,6 +12,8 @@
 
 namespace fs = std::filesystem;
 
+int SKIP_FRAMES = 3;
+
 int extract_images() {
     std::string video_path = "data/IMG_0243.MOV";
     if (!fs::exists(video_path)) {
@@ -134,7 +136,7 @@ int loop_closing() {
     // Get first two frames
     std::string first_frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", current_frame_index) + ".png";
     readFrame(first_frame_path, previous_frame);
-    current_frame_index++;
+    current_frame_index += SKIP_FRAMES;
     std::string second_frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", current_frame_index) + ".png";
     readFrame(second_frame_path, current_frame);
 
@@ -215,7 +217,7 @@ int loop_closing() {
     T_total = T1;
     all_poses.push_back(T_total.clone());
 
-    current_frame_index++;
+    current_frame_index += SKIP_FRAMES;
 
     // Loop over remaining frames
     while (true) {
@@ -314,7 +316,7 @@ int loop_closing() {
         std::cout << "Frame " << current_frame_index << " - PnP Inliers: " << pnp_world_points.size() 
                     << " - Map Size: " << world_points.size() << std::endl;
 
-        current_frame_index++;
+        current_frame_index += SKIP_FRAMES;
     }
 
     // Save the trajectory
