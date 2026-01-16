@@ -12,7 +12,7 @@
 
 namespace fs = std::filesystem;
 
-int SKIP_FRAMES = 20;
+int SKIP_FRAMES = 3;
 
 int extract_images() {
     std::string video_path = "data/IMG_0243.MOV";
@@ -160,10 +160,12 @@ int loop_closing() {
     // --------------------------------------------------------------------------------------------------
     // Initialization (frame 0 & 1)
 
-    // Camera matrix
-    double focal = 712.8;
-    cv::Point2d pp(540, 960); // assuming the principal point is at the center of the image
-    cv::Mat K = (cv::Mat_<double>(3, 3) << focal, 0, pp.x, 0, focal, pp.y, 0, 0, 1);
+    // Camera matrix from chessboard calibration
+    const double fx = 2278.314580683383;
+    const double fy = 2285.883046238368;
+    const double cx = 2165.251737468604;
+    const double cy = 2802.513071510824;
+    cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
 
     // Match features between frame 0 and 1
     cv::BFMatcher matcher(cv::NORM_HAMMING); // Use Hamming distance
