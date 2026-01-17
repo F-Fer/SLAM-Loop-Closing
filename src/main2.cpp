@@ -14,6 +14,7 @@
 //
 // Note: This is a research-style demo, not production code. No bundle adjustment.
 
+#include "extract_images.hpp"
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -30,7 +31,7 @@
 namespace fs = std::filesystem;
 
 int SKIP_FRAMES = 10;
-std::string VIDEO_FILENAME = "IMG_0277.MOV";
+std::string VIDEO_FILENAME = "IMG_0280.MOV";
 
 
 struct CameraPose
@@ -47,6 +48,29 @@ struct Observation
 };
 
 // --- Utility functions --------------------------------------------------------
+
+int extract_images(std::string video_filename) {
+    std::string video_path = "data/" + video_filename;
+    if (!fs::exists(video_path)) {
+        video_path = "../data/" + video_filename;
+    }
+    
+    std::string video_name = video_filename.substr(0, video_filename.find('.'));
+    std::string output_dir = "data/extracted_frames/" + video_name;
+    if (!fs::exists("data") && fs::exists("../data")) {
+        output_dir = "../data/extracted_frames/" + video_name;
+    }
+
+    std::cout << "Starting image extraction from: " << video_path << std::endl;
+    if (extract_images_from_mov(video_path, output_dir)) {
+        std::cout << "Extraction completed successfully." << std::endl;
+    } else {
+        std::cerr << "Extraction failed." << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
 
 // Convert CameraPose (R, t) to 6D parameter vector p = [rx, ry, rz, tx, ty, tz]
 // where (rx, ry, rz) is Rodrigues rotation vector (angle-axis).
@@ -649,6 +673,9 @@ int main(int argc, char** argv)
     try
     {
         std::string video_name = VIDEO_FILENAME.substr(0, VIDEO_FILENAME.find('.'));
+
+        extract_images(VIDEO_FILENAME);
+
         // Find the extracted frames directory
         std::string extracted_frames_dir = "data/extracted_frames/" + video_name;
         if (!fs::exists(extracted_frames_dir)) {
@@ -679,15 +706,16 @@ int main(int argc, char** argv)
         //
         // K must be double-precision for the code below.
         // Camera intrinsics + distortion from chessboard calibration
-        const double fx = 1762.753483943652;
-        const double fy = 1769.06216492707;
-        const double cx = 533.3593669233525;
-        const double cy = 954.1640910735737;
+        const double fx = 1226.991674550505;
+        const double fy = 1231.583548480416;
+        const double cx = 529.5391035340654;
+        const double cy = 936.7114915473007;
         cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+        // Distortion coefficients: [0.009593106889362086, -0.08836017837645339, -0.002369764239215277, -0.002095085353035259, 0.1736273482549004]
         cv::Mat distCoeffs = (cv::Mat_<double>(1, 5)
-            << 0.3350700377460379, -2.751579717545341,
-            -0.001513356719501493, -0.0009902019587527879,
-            7.747737515737778);
+            << 0.009593106889362086, -0.08836017837645339,
+            -0.002369764239215277, -0.002095085353035259,
+            0.1736273482549004);
 
         
 
