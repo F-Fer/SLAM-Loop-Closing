@@ -736,7 +736,12 @@ int main(int argc, char** argv)
                 std::cerr << "Failed to load image: " << argv[i] << std::endl;
                 return EXIT_FAILURE;
             }
-            images.push_back(img);
+
+            // UNDISTORTION
+            cv::Mat imgUndistorted;
+            cv::undistort(img, imgUndistorted, K, distCoeffs);
+
+            images.push_back(imgUndistorted);
         }
 
         const int numViews = static_cast<int>(images.size());
@@ -768,32 +773,39 @@ int main(int argc, char** argv)
         std::vector<cv::Point3d> all3DPoints; // aggregated 3D points from all pairs
         std::vector<Observation> observations;
         
-        for (int i = 0; i < numViews - 1; ++i)
-        {
-            std::cout << "\nProcessing image pair " << i << " -> " << (i + 1) << " ..." << std::endl;
+        // Use a while loop to allow dynamic skipping of frames
+        int i = 0; // Index of the current reference frame (camera 1)
+        int j = 1; // Index of the candidate frame (camera 2)
 
-            // 5.1 Match features between view i and i+1
+        while (j < numViews)
+        {
+            std::cout << "\nProcessing image pair " << i << " -> " << j << " ..." << std::endl;
+
+            // 5.1 Match features between view i and j
             std::vector<cv::DMatch> matches;
-            matchFeatures(allDescriptors[i], allDescriptors[i+1], matches);
+            matchFeatures(allDescriptors[i], allDescriptors[j], matches);
 
             std::cout << "  Raw good matches after ratio test: " << matches.size() << std::endl;
-            if (matches.size() < 20)
+            if (matches.size() < 100) // Increased threshold for robustness
             {
-                std::cerr << "  Too few matches between images " << i << " and " << (i + 1)
-                          << ". Skipping this pair." << std::endl;
+                std::cerr << "  Too few matches. Skipping candidate frame " << j << "." << std::endl;
+                j++; // Try next frame
                 continue;
             }
 
             std::vector<cv::Point2f> pts1, pts2;
-            extractMatchedPoints(allKeypoints[i], allKeypoints[i+1], matches, pts1, pts2);
+            extractMatchedPoints(allKeypoints[i], allKeypoints[j], matches, pts1, pts2);
 
             // 5.2 Estimate essential matrix and relative pose
             cv::Mat inlierMask;
             cv::Mat R, t;
 
+            // If pose estimation fails, skip this candidate frame and try the next one
+            // relative to the SAME reference frame i.
             if (!estimateRelativePoseFromEssential(K, pts1, pts2, R, t, inlierMask))
             {
-                std::cerr << "  Pose estimation failed for pair " << i << " -> " << (i + 1) << std::endl;
+                std::cerr << "  Pose estimation failed. Skipping candidate frame " << j << "." << std::endl;
+                j++;
                 continue;
             }
 
@@ -801,28 +813,25 @@ int main(int argc, char** argv)
             std::cout << "  Inliers after essential matrix + recoverPose: "
                       << inlierCount << std::endl;
 
-            // 5.3 Compute global pose for camera (i+1)
-            //
-            // recoverPose gives transform from camera i to camera (i+1):
-            // X_{i+1} = R * X_i + t
-            //
-            // If pose[i] transforms world -> camera i:
-            //   X_i = R_i * X_w + t_i
-            //
-            // Then:
-            //   X_{i+1} = R * (R_i X_w + t_i) + t = (R R_i) X_w + (R t_i + t)
-            //
-            // => R_{i+1} = R * R_i, t_{i+1} = R * t_i + t
+            // Double check inlier ratio (robustness)
+            double inlierRatio = (double)inlierCount / matches.size();
+            if (inlierRatio < 0.2) // Heuristic: if less than 20% are consistent, it's likely junk
+            {
+                 std::cerr << "  Inlier ratio too low (" << inlierRatio * 100 << "%). Geometric consistency failed. Skipping frame " << j << std::endl;
+                 j++;
+                 continue;
+            }
 
-            // If previous pose was not computed (e.g. tracking failure), reset to identity
+            // 5.3 Compute global pose for camera j
+            // Check if previous pose was valid
             if (poses[i].R.empty()) {
                 std::cout << "  [WARNING] Previous pose (camera " << i << ") invalid. Resetting to Identity." << std::endl;
                 poses[i].R = cv::Mat::eye(3, 3, CV_64F);
                 poses[i].t = cv::Mat::zeros(3, 1, CV_64F);
             }
 
-            poses[i+1].R = R * poses[i].R;
-            poses[i+1].t = R * poses[i].t + t;
+            poses[j].R = R * poses[i].R;
+            poses[j].t = R * poses[i].t + t; // Note: 't' is unit length (scale=1.0)
 
             // 5.4 Triangulate 3D points for this inlier set
             std::vector<cv::Point2f> inlierPts1, inlierPts2;
@@ -838,16 +847,15 @@ int main(int argc, char** argv)
                 }
             }
 
-            // Projection matrices P1 and P2 (world coordinates -> image pixels)
-            cv::Mat P1(3, 4, CV_64F);
-            cv::Mat P2(3, 4, CV_64F);
-
+            // Projection matrices P1 and P2
+            cv::Mat P1(3, 4, CV_64F), P2(3, 4, CV_64F);
+            
             {
                 // P = K [R | t]
                 cv::hconcat(poses[i].R, poses[i].t, P1);
                 P1 = K * P1;
 
-                cv::hconcat(poses[i+1].R, poses[i+1].t, P2);
+                cv::hconcat(poses[j].R, poses[j].t, P2);
                 P2 = K * P2;
             }
 
@@ -855,13 +863,11 @@ int main(int argc, char** argv)
             cv::triangulatePoints(P1, P2, inlierPts1, inlierPts2, points4D);
 
             int nTriangulated = 0;
-
             for (int k = 0; k < points4D.cols; ++k)
             {
                 cv::Mat col = points4D.col(k);
                 double w = col.at<float>(3, 0);
-                if (std::abs(w) < 1e-9)
-                    continue;
+                if (std::abs(w) < 1e-9) continue;
 
                 double X = col.at<float>(0, 0) / w;
                 double Y = col.at<float>(1, 0) / w;
@@ -869,24 +875,29 @@ int main(int argc, char** argv)
 
                 cv::Point3d Xw(X, Y, Z);
 
-                // Simple cheirality check: point in front of both cameras
+                // Cheirality check relative to both cameras
                 cv::Mat XwMat = (cv::Mat_<double>(3,1) << X, Y, Z);
                 cv::Mat Xc1 = poses[i].R * XwMat + poses[i].t;
-                cv::Mat Xc2 = poses[i+1].R * XwMat + poses[i+1].t;
+                cv::Mat Xc2 = poses[j].R * XwMat + poses[j].t;
 
-                if (Xc1.at<double>(2) <= 0 || Xc2.at<double>(2) <= 0)
-                    continue;
+                if (Xc1.at<double>(2) <= 0 || Xc2.at<double>(2) <= 0) continue;
+                
+                // Optional: Filter far away points to reduce "mess"
+                if (cv::norm(XwMat) > 100.0) continue; 
 
                 int pointIndex = static_cast<int>(all3DPoints.size());
                 all3DPoints.push_back(Xw);
                 nTriangulated++;
 
-                // Observations: one in each image
-                observations.push_back({i,   pointIndex,
-                                        cv::Point2d(inlierPts1[k].x, inlierPts1[k].y)});
-                observations.push_back({i+1, pointIndex,
-                                        cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                observations.push_back({i, pointIndex, cv::Point2d(inlierPts1[k].x, inlierPts1[k].y)});
+                observations.push_back({j, pointIndex, cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
             }
+            
+            std::cout << "  Triangulated " << nTriangulated << " points." << std::endl;
+
+            // Successful Step: Advance reference to current
+            i = j;
+            j = i + 1;
         }
 
         // --- 6. Report results ----------------------------------------------
