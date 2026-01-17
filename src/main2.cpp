@@ -17,6 +17,7 @@
 #include "extract_images.hpp"
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <vector>
 #include <string>
 #include <stdexcept>
@@ -30,8 +31,15 @@
 
 namespace fs = std::filesystem;
 
-int SKIP_FRAMES = 30;
+// === CONFIGURATION ===
 std::string VIDEO_FILENAME = "IMG_0280.MOV";
+
+// Keyframe selection thresholds
+const double MIN_MEDIAN_DISPLACEMENT = 20.0;   // Minimum median pixel displacement for keyframe
+const double MAX_MEDIAN_DISPLACEMENT = 150.0;  // Maximum displacement (too much motion = blur)
+const int MIN_TRACKED_FEATURES = 100;          // Minimum features to track
+const double MIN_INLIER_RATIO = 0.3;           // Minimum inlier ratio for good pose
+const int MIN_INLIERS_FOR_KEYFRAME = 50;       // Minimum inliers to accept keyframe
 
 
 struct CameraPose
@@ -124,6 +132,30 @@ inline cv::Point2d projectPoint(
     double v = K.at<double>(1,1) * y / z + K.at<double>(1,2);
 
     return cv::Point2d(u, v);
+}
+
+/**
+ * @brief Compute median displacement between matched point pairs.
+ * Used for keyframe selection - ensures sufficient parallax.
+ */
+double computeMedianDisplacement(
+    const std::vector<cv::Point2f>& pts1,
+    const std::vector<cv::Point2f>& pts2)
+{
+    if (pts1.empty()) return 0.0;
+    
+    std::vector<double> displacements;
+    displacements.reserve(pts1.size());
+    
+    for (size_t i = 0; i < pts1.size(); ++i)
+    {
+        double dx = pts2[i].x - pts1[i].x;
+        double dy = pts2[i].y - pts1[i].y;
+        displacements.push_back(std::sqrt(dx*dx + dy*dy));
+    }
+    
+    std::sort(displacements.begin(), displacements.end());
+    return displacements[displacements.size() / 2];
 }
 
 /**
@@ -691,18 +723,15 @@ int main(int argc, char** argv)
             }
         }
 
-        // find all frames and save the frame paths to a vector
-        std::vector<std::string> argv;
-        for (int i = 0; ; i += SKIP_FRAMES) {
+        // find ALL frames (we'll select keyframes dynamically)
+        std::vector<std::string> allFramePaths;
+        for (int i = 0; ; ++i) {
             std::string frame_path = extracted_frames_dir + "/frame_" + std::format("{:04d}", i) + ".png";
             if (!fs::exists(frame_path)) break;
-            
-            argv.push_back(frame_path);
+            allFramePaths.push_back(frame_path);
         }
-
-        argc = argv.size();
-
-        std::cout << "Loaded " << argc << " frames." << std::endl;
+        
+        std::cout << "Found " << allFramePaths.size() << " total frames in sequence." << std::endl;
 
         // --- 1. Camera intrinsics (K) ----------------------------------------
         //
@@ -723,214 +752,242 @@ int main(int argc, char** argv)
 
         
 
-        // --- 2. Load input images -------------------------------------------
-
-        std::vector<cv::Mat> images;
-        images.reserve(argc - 1);
-
-        for (int i = 0; i < argc; ++i)
-        {
-            cv::Mat img = cv::imread(argv[i], cv::IMREAD_GRAYSCALE);
-            if (img.empty())
-            {
-                std::cerr << "Failed to load image: " << argv[i] << std::endl;
-                return EXIT_FAILURE;
-            }
-
-            // UNDISTORTION
-            cv::Mat imgUndistorted;
-            cv::undistort(img, imgUndistorted, K, distCoeffs);
-
-            images.push_back(imgUndistorted);
-        }
-
-        const int numViews = static_cast<int>(images.size());
-        std::cout << "Loaded " << numViews << " images." << std::endl;
-
-        // --- 3. Detect SIFT features & descriptors for each image -----------
-
-        std::vector<std::vector<cv::KeyPoint>> allKeypoints(numViews);
-        std::vector<cv::Mat> allDescriptors(numViews);
-
-        for (int i = 0; i < numViews; ++i)
-        {
-            detectAndDescribeSIFT(images[i], allKeypoints[i], allDescriptors[i]);
-            std::cout << "Image " << i << ": " << allKeypoints[i].size()
-                      << " keypoints." << std::endl;
-        }
-
-        // --- 4. Initialize camera poses -------------------------------------
+        // --- 2. Keyframe-based processing with dynamic selection ---------------
         //
-        // We choose the first camera as the world reference:
-        // R_0 = Identity, t_0 = 0. Subsequent poses are relative to this.
-        std::vector<CameraPose> poses(numViews);
-
-        poses[0].R = cv::Mat::eye(3, 3, CV_64F);
-        poses[0].t = cv::Mat::zeros(3, 1, CV_64F);
-
-        // --- 5. For each consecutive pair, estimate relative pose and triangulate
-
-        std::vector<cv::Point3d> all3DPoints; // aggregated 3D points from all pairs
+        // Instead of loading all frames, we process incrementally:
+        // - Load frame, extract features
+        // - Match to last keyframe
+        // - Decide if this frame should be a keyframe based on:
+        //   1) Sufficient parallax (median displacement)
+        //   2) Enough tracked features
+        //   3) Good geometric consistency
+        
+        std::vector<cv::Mat> keyframeImages;
+        std::vector<std::vector<cv::KeyPoint>> allKeypoints;
+        std::vector<cv::Mat> allDescriptors;
+        std::vector<CameraPose> poses;
+        std::vector<int> keyframeIndices; // Maps keyframe index to original frame index
+        
+        std::vector<cv::Point3d> all3DPoints;
         std::vector<Observation> observations;
         
-        // Track which keypoint in which frame corresponds to which 3D point index
-        // keypointToPointIdx[camIdx][keypointIdx] = point3DIdx (or -1)
-        std::vector<std::vector<int>> keypointToPointIdx(numViews);
-        for(int i=0; i<numViews; ++i) {
-            keypointToPointIdx[i].assign(allKeypoints[i].size(), -1);
+        // Track which keypoint in which keyframe corresponds to which 3D point
+        std::vector<std::vector<int>> keypointToPointIdx;
+        
+        // Process first frame as keyframe 0
+        {
+            cv::Mat img = cv::imread(allFramePaths[0], cv::IMREAD_GRAYSCALE);
+            cv::Mat imgUndistorted;
+            cv::undistort(img, imgUndistorted, K, distCoeffs);
+            keyframeImages.push_back(imgUndistorted);
+            
+            std::vector<cv::KeyPoint> kpts;
+            cv::Mat desc;
+            detectAndDescribeSIFT(imgUndistorted, kpts, desc);
+            allKeypoints.push_back(kpts);
+            allDescriptors.push_back(desc);
+            
+            CameraPose pose0;
+            pose0.R = cv::Mat::eye(3, 3, CV_64F);
+            pose0.t = cv::Mat::zeros(3, 1, CV_64F);
+            poses.push_back(pose0);
+            
+            keypointToPointIdx.push_back(std::vector<int>(kpts.size(), -1));
+            keyframeIndices.push_back(0);
+            
+            std::cout << "Keyframe 0 (frame 0): " << kpts.size() << " keypoints" << std::endl;
         }
         
-        // Use a while loop to allow dynamic skipping of frames
-        int i = 0; // Index of the current reference frame (camera 1)
-        int j = 1; // Index of the candidate frame (camera 2)
-
-        while (j < numViews)
+        int lastKeyframeIdx = 0;  // Index in keyframe arrays
+        int lastKeyframeFrameIdx = 0;  // Index in original frame sequence
+        
+        // Process remaining frames
+        for (size_t frameIdx = 1; frameIdx < allFramePaths.size(); ++frameIdx)
         {
-            std::cout << "\nProcessing image pair " << i << " -> " << j << " ..." << std::endl;
-
-            // 5.1 Match features between view i and j
+            // Load and undistort current frame
+            cv::Mat img = cv::imread(allFramePaths[frameIdx], cv::IMREAD_GRAYSCALE);
+            if (img.empty()) continue;
+            
+            cv::Mat imgUndistorted;
+            cv::undistort(img, imgUndistorted, K, distCoeffs);
+            
+            // Extract features
+            std::vector<cv::KeyPoint> currKpts;
+            cv::Mat currDesc;
+            detectAndDescribeSIFT(imgUndistorted, currKpts, currDesc);
+            
+            // Match to last keyframe
             std::vector<cv::DMatch> matches;
-            matchFeatures(allDescriptors[i], allDescriptors[j], matches);
-
-            std::cout << "  Raw good matches after ratio test: " << matches.size() << std::endl;
-            if (matches.size() < 100) // Increased threshold for robustness
+            matchFeatures(allDescriptors[lastKeyframeIdx], currDesc, matches);
+            
+            if (matches.size() < MIN_TRACKED_FEATURES)
             {
-                std::cerr << "  Too few matches. Skipping candidate frame " << j << "." << std::endl;
-                j++; // Try next frame
+                // Too few matches - might need to force a keyframe or skip
                 continue;
             }
-
+            
+            // Extract matched points
             std::vector<cv::Point2f> pts1, pts2;
-            extractMatchedPoints(allKeypoints[i], allKeypoints[j], matches, pts1, pts2);
-
-            // 5.2 Estimate essential matrix and relative pose
-            cv::Mat inlierMask;
-            cv::Mat R, t;
-
-            // If pose estimation fails, skip this candidate frame and try the next one
-            // relative to the SAME reference frame i.
+            extractMatchedPoints(allKeypoints[lastKeyframeIdx], currKpts, matches, pts1, pts2);
+            
+            // === KEYFRAME SELECTION CRITERIA ===
+            double medianDisp = computeMedianDisplacement(pts1, pts2);
+            
+            // Check if we have sufficient parallax
+            if (medianDisp < MIN_MEDIAN_DISPLACEMENT)
+            {
+                // Not enough motion yet - skip this frame
+                continue;
+            }
+            
+            if (medianDisp > MAX_MEDIAN_DISPLACEMENT)
+            {
+                // Too much motion - might be blurry or tracking lost
+                std::cout << "Frame " << frameIdx << ": displacement too large (" 
+                          << medianDisp << " px), skipping" << std::endl;
+                continue;
+            }
+            
+            // Estimate pose
+            cv::Mat inlierMask, R, t;
             if (!estimateRelativePoseFromEssential(K, pts1, pts2, R, t, inlierMask))
             {
-                std::cerr << "  Pose estimation failed. Skipping candidate frame " << j << "." << std::endl;
-                j++;
                 continue;
             }
-
+            
             int inlierCount = cv::countNonZero(inlierMask);
-            std::cout << "  Inliers after essential matrix + recoverPose: "
-                      << inlierCount << std::endl;
-
-            // Double check inlier ratio (robustness)
             double inlierRatio = (double)inlierCount / matches.size();
-            if (inlierRatio < 0.2) // Heuristic: if less than 20% are consistent, it's likely junk
+            
+            if (inlierCount < MIN_INLIERS_FOR_KEYFRAME || inlierRatio < MIN_INLIER_RATIO)
             {
-                 std::cerr << "  Inlier ratio too low (" << inlierRatio * 100 << "%). Geometric consistency failed. Skipping frame " << j << std::endl;
-                 j++;
-                 continue;
+                continue;
             }
-
-            // 5.3 Compute global pose for camera j
-            // Check if previous pose was valid
-            if (poses[i].R.empty()) {
-                std::cout << "  [WARNING] Previous pose (camera " << i << ") invalid. Resetting to Identity." << std::endl;
-                poses[i].R = cv::Mat::eye(3, 3, CV_64F);
-                poses[i].t = cv::Mat::zeros(3, 1, CV_64F);
-            }
-
-            poses[j].R = R * poses[i].R;
-            poses[j].t = R * poses[i].t + t; // Note: 't' is unit length (scale=1.0)
-
-            // 5.4 Triangulate 3D points for this inlier set
+            
+            // === ACCEPT AS KEYFRAME ===
+            int newKeyframeIdx = static_cast<int>(poses.size());
+            
+            std::cout << "\nKeyframe " << newKeyframeIdx << " (frame " << frameIdx << "): "
+                      << "disp=" << std::fixed << std::setprecision(1) << medianDisp << "px, "
+                      << "matches=" << matches.size() << ", "
+                      << "inliers=" << inlierCount << " (" << std::setprecision(0) << inlierRatio*100 << "%)"
+                      << std::endl;
+            
+            // Store keyframe data
+            keyframeImages.push_back(imgUndistorted);
+            allKeypoints.push_back(currKpts);
+            allDescriptors.push_back(currDesc);
+            keyframeIndices.push_back(static_cast<int>(frameIdx));
+            keypointToPointIdx.push_back(std::vector<int>(currKpts.size(), -1));
+            
+            // Compute global pose
+            CameraPose newPose;
+            newPose.R = R * poses[lastKeyframeIdx].R;
+            newPose.t = R * poses[lastKeyframeIdx].t + t;
+            poses.push_back(newPose);
+            
+            // === TRIANGULATE AND MERGE MAP POINTS ===
+            // Build projection matrices
+            cv::Mat P1(3, 4, CV_64F), P2(3, 4, CV_64F);
+            cv::hconcat(poses[lastKeyframeIdx].R, poses[lastKeyframeIdx].t, P1);
+            P1 = K * P1;
+            cv::hconcat(newPose.R, newPose.t, P2);
+            P2 = K * P2;
+            
+            // Collect inlier points and track original indices
             std::vector<cv::Point2f> inlierPts1, inlierPts2;
-            inlierPts1.reserve(inlierCount);
-            inlierPts2.reserve(inlierCount);
-
-            for (size_t k = 0; k < pts1.size(); ++k)
+            std::vector<int> inlierMatchIndices;
+            
+            for (size_t k = 0; k < matches.size(); ++k)
             {
                 if (inlierMask.at<uchar>(static_cast<int>(k)))
                 {
                     inlierPts1.push_back(pts1[k]);
                     inlierPts2.push_back(pts2[k]);
+                    inlierMatchIndices.push_back(static_cast<int>(k));
                 }
             }
-
-            // Projection matrices P1 and P2
-            cv::Mat P1(3, 4, CV_64F), P2(3, 4, CV_64F);
             
-            {
-                // P = K [R | t]
-                cv::hconcat(poses[i].R, poses[i].t, P1);
-                P1 = K * P1;
-
-                cv::hconcat(poses[j].R, poses[j].t, P2);
-                P2 = K * P2;
-            }
-
+            // Triangulate
             cv::Mat points4D;
             cv::triangulatePoints(P1, P2, inlierPts1, inlierPts2, points4D);
-
+            
             int nTriangulated = 0;
+            int nMerged = 0;
+            
             for (int k = 0; k < points4D.cols; ++k)
             {
+                int matchIdx = inlierMatchIndices[k];
+                int kptIdx1 = matches[matchIdx].queryIdx;  // Keypoint index in last keyframe
+                int kptIdx2 = matches[matchIdx].trainIdx;  // Keypoint index in current frame
+                
                 cv::Mat col = points4D.col(k);
                 double w = col.at<float>(3, 0);
                 if (std::abs(w) < 1e-9) continue;
-
+                
                 double X = col.at<float>(0, 0) / w;
                 double Y = col.at<float>(1, 0) / w;
                 double Z = col.at<float>(2, 0) / w;
-
+                
                 cv::Point3d Xw(X, Y, Z);
-
-                // Cheirality check relative to both cameras
                 cv::Mat XwMat = (cv::Mat_<double>(3,1) << X, Y, Z);
-                cv::Mat Xc1 = poses[i].R * XwMat + poses[i].t;
-                cv::Mat Xc2 = poses[j].R * XwMat + poses[j].t;
-
+                
+                // Cheirality check
+                cv::Mat Xc1 = poses[lastKeyframeIdx].R * XwMat + poses[lastKeyframeIdx].t;
+                cv::Mat Xc2 = newPose.R * XwMat + newPose.t;
                 if (Xc1.at<double>(2) <= 0 || Xc2.at<double>(2) <= 0) continue;
                 
-                // Optional: Filter far away points to reduce "mess"
-                if (cv::norm(XwMat) > 100.0) continue; 
-
-                int pointIndex = static_cast<int>(all3DPoints.size());
-                all3DPoints.push_back(Xw);
-                nTriangulated++;
-
-                observations.push_back({i, pointIndex, cv::Point2d(inlierPts1[k].x, inlierPts1[k].y)});
-                observations.push_back({j, pointIndex, cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                // Distance filter
+                if (cv::norm(XwMat) > 100.0) continue;
                 
-                // Update keypointToPointIdx map
-                // We need to find the original indices in allKeypoints.
-                // 'pts1' was built from matches[k].queryIdx
-                // 'pts2' was built from matches[k].trainIdx
-                // However, we filtered matches by inlierMask.
-                // We must re-trace the index.
+                // === MAP POINT MERGING ===
+                // Check if the keypoint in the last keyframe already has an associated 3D point
+                int existingPointIdx = keypointToPointIdx[lastKeyframeIdx][kptIdx1];
                 
-                // The k-th inlier corresponds to the k-th element in pts1/pts2 (which we iterated over).
-                // Wait, the loop above iterates `k < pts1.size()`.
-                // pts1[k] came from matches[k].
-                
-                int originalIdx1 = matches[k].queryIdx;
-                int originalIdx2 = matches[k].trainIdx;
-                
-                keypointToPointIdx[i][originalIdx1] = pointIndex;
-                keypointToPointIdx[j][originalIdx2] = pointIndex;
+                if (existingPointIdx != -1)
+                {
+                    // MERGE: This feature was already triangulated from an earlier pair
+                    // Just add an observation for the new keyframe to the existing point
+                    observations.push_back({newKeyframeIdx, existingPointIdx, 
+                                           cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                    keypointToPointIdx[newKeyframeIdx][kptIdx2] = existingPointIdx;
+                    nMerged++;
+                }
+                else
+                {
+                    // NEW POINT: Create new 3D point
+                    int pointIndex = static_cast<int>(all3DPoints.size());
+                    all3DPoints.push_back(Xw);
+                    
+                    observations.push_back({lastKeyframeIdx, pointIndex, 
+                                           cv::Point2d(inlierPts1[k].x, inlierPts1[k].y)});
+                    observations.push_back({newKeyframeIdx, pointIndex, 
+                                           cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                    
+                    keypointToPointIdx[lastKeyframeIdx][kptIdx1] = pointIndex;
+                    keypointToPointIdx[newKeyframeIdx][kptIdx2] = pointIndex;
+                    nTriangulated++;
+                }
             }
             
-            std::cout << "  Triangulated " << nTriangulated << " points." << std::endl;
-
-            // Successful Step: Advance reference to current
-            i = j;
-            j = i + 1;
+            std::cout << "  New points: " << nTriangulated << ", Merged: " << nMerged << std::endl;
+            
+            // Update last keyframe
+            lastKeyframeIdx = newKeyframeIdx;
+            lastKeyframeFrameIdx = static_cast<int>(frameIdx);
         }
+        
+        const int numViews = static_cast<int>(poses.size());
+        std::cout << "\n=== Keyframe Selection Complete ===" << std::endl;
+        std::cout << "Total keyframes: " << numViews << " (from " << allFramePaths.size() << " frames)" << std::endl;
+        std::cout << "Total 3D points: " << all3DPoints.size() << std::endl;
 
-        // --- 6. Loop Closure ------------------------------------------------
+        // --- 3. Loop Closure ------------------------------------------------
         // Find the SINGLE BEST loop closure across the entire trajectory
         // Then correct pose drift before adding observations
         
         std::cout << "\n=== Starting Loop Closure Detection ===" << std::endl;
         
-        int loopGap = numViews / 2; // Loop must span at least half the trajectory
+        int loopGap = std::max(3, numViews / 2); // Loop must span at least half the trajectory
         
         // Variables to track the globally best loop closure
         int globalBestCurrFrame = -1;
@@ -1072,21 +1129,26 @@ int main(int argc, char** argv)
         }
 
 
-        // --- 7. Report results ----------------------------------------------
+        // --- 4. Report results ----------------------------------------------
 
         std::cout << "\n=== Reconstruction Summary ===" << std::endl;
-        std::cout << "Number of views: " << numViews << std::endl;
-        std::cout << "Total 3D points (unfiltered, from all pairs): "
-                  << all3DPoints.size() << std::endl;
-
-        for (int i = 0; i < numViews; ++i)
-        {
-            std::cout << "\nCamera " << i << " pose (R|t):" << std::endl;
-            std::cout << "R = " << std::endl << poses[i].R << std::endl;
-            std::cout << "t = " << std::endl << poses[i].t << std::endl;
+        std::cout << "Number of keyframes: " << numViews << std::endl;
+        std::cout << "Total 3D points: " << all3DPoints.size() << std::endl;
+        std::cout << "Total observations: " << observations.size() << std::endl;
+        
+        // Print first and last few poses
+        std::cout << "\nFirst keyframe pose (origin):" << std::endl;
+        std::cout << "  R = I, t = [0,0,0]" << std::endl;
+        
+        if (numViews > 1) {
+            std::cout << "\nLast keyframe pose (keyframe " << numViews-1 
+                      << ", frame " << keyframeIndices[numViews-1] << "):" << std::endl;
+            cv::Mat C = -poses[numViews-1].R.t() * poses[numViews-1].t;
+            std::cout << "  Camera center: [" << C.at<double>(0) << ", " 
+                      << C.at<double>(1) << ", " << C.at<double>(2) << "]" << std::endl;
         }
 
-        // --- 7. Refine using interleaved bundle adjustment --------------------
+        // --- 5. Refine using interleaved bundle adjustment --------------------
 
         double errBefore = computeReprojectionError(K, poses, all3DPoints, observations);
         std::cout << "\nReprojection error BEFORE BA: " << errBefore << " px" << std::endl;
@@ -1102,7 +1164,7 @@ int main(int argc, char** argv)
         double errAfter = computeReprojectionError(K, poses, all3DPoints, observations);
         std::cout << "\nReprojection error AFTER BA: " << errAfter << " px" << std::endl;
         
-        // --- 8. Save to OBJ --------------------------------------------------
+        // --- 6. Save to OBJ --------------------------------------------------
 
         // Save with timestamp
         std::string timestamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
