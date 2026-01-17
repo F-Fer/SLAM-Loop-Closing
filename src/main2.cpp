@@ -50,17 +50,22 @@ struct Observation
 // --- Utility functions --------------------------------------------------------
 
 int extract_images(std::string video_filename) {
-    std::string video_path = "data/" + video_filename;
-    if (!fs::exists(video_path)) {
-        video_path = "../data/" + video_filename;
-    }
-    
     std::string video_name = video_filename.substr(0, video_filename.find('.'));
     std::string output_dir = "data/extracted_frames/" + video_name;
     if (!fs::exists("data") && fs::exists("../data")) {
         output_dir = "../data/extracted_frames/" + video_name;
     }
 
+    if (fs::exists(output_dir)) {
+        std::cout << "Output directory " << output_dir << " already exists. Skipping extraction." << std::endl;
+        return 0;
+    }
+
+    std::string video_path = "data/" + video_filename;
+    if (!fs::exists(video_path)) {
+        video_path = "../data/" + video_filename;
+    }
+    
     std::cout << "Starting image extraction from: " << video_path << std::endl;
     if (extract_images_from_mov(video_path, output_dir)) {
         std::cout << "Extraction completed successfully." << std::endl;
@@ -711,7 +716,6 @@ int main(int argc, char** argv)
         const double cx = 529.5391035340654;
         const double cy = 936.7114915473007;
         cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
-        // Distortion coefficients: [0.009593106889362086, -0.08836017837645339, -0.002369764239215277, -0.002095085353035259, 0.1736273482549004]
         cv::Mat distCoeffs = (cv::Mat_<double>(1, 5)
             << 0.009593106889362086, -0.08836017837645339,
             -0.002369764239215277, -0.002095085353035259,
