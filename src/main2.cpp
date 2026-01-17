@@ -41,6 +41,15 @@ const int MIN_TRACKED_FEATURES = 100;          // Minimum features to track
 const double MIN_INLIER_RATIO = 0.3;           // Minimum inlier ratio for good pose
 const int MIN_INLIERS_FOR_KEYFRAME = 50;       // Minimum inliers to accept keyframe
 
+// Triangulation quality thresholds
+const double MIN_PARALLAX_DEG = 1.0;           // Minimum triangulation angle (degrees)
+const double MAX_REPROJ_ERROR = 4.0;           // Maximum reprojection error for triangulated point
+const double MIN_DEPTH = 0.1;                  // Minimum depth (relative to baseline)
+const double MAX_DEPTH = 50.0;                 // Maximum depth (relative to baseline)
+
+// Outlier removal thresholds
+const double OUTLIER_REPROJ_THRESHOLD = 5.0;   // Remove points with reproj error > this after BA
+
 
 struct CameraPose
 {
@@ -156,6 +165,73 @@ double computeMedianDisplacement(
     
     std::sort(displacements.begin(), displacements.end());
     return displacements[displacements.size() / 2];
+}
+
+/**
+ * @brief Compute the triangulation angle (parallax) between two camera rays.
+ * Good triangulation requires sufficient parallax (typically > 1-2 degrees).
+ * 
+ * @param C1 Camera center 1 in world coordinates
+ * @param C2 Camera center 2 in world coordinates
+ * @param X  3D point in world coordinates
+ * @return Angle in degrees between the two rays
+ */
+double computeParallaxAngle(
+    const cv::Mat& C1,
+    const cv::Mat& C2,
+    const cv::Point3d& X)
+{
+    cv::Mat Xm = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
+    
+    cv::Mat ray1 = Xm - C1;
+    cv::Mat ray2 = Xm - C2;
+    
+    double norm1 = cv::norm(ray1);
+    double norm2 = cv::norm(ray2);
+    
+    if (norm1 < 1e-9 || norm2 < 1e-9) return 0.0;
+    
+    ray1 /= norm1;
+    ray2 /= norm2;
+    
+    double cosAngle = ray1.dot(ray2);
+    cosAngle = std::max(-1.0, std::min(1.0, cosAngle)); // Clamp for numerical stability
+    
+    return std::acos(cosAngle) * 180.0 / CV_PI;
+}
+
+/**
+ * @brief Compute reprojection error for a single 3D point in one camera.
+ */
+double computeSingleReprojError(
+    const cv::Mat& K,
+    const CameraPose& pose,
+    const cv::Point3d& X,
+    const cv::Point2d& observed)
+{
+    cv::Mat Xw = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
+    cv::Mat Xc = pose.R * Xw + pose.t;
+    
+    double z = Xc.at<double>(2);
+    if (z <= 0) return 1e9; // Behind camera
+    
+    double u = K.at<double>(0,0) * Xc.at<double>(0) / z + K.at<double>(0,2);
+    double v = K.at<double>(1,1) * Xc.at<double>(1) / z + K.at<double>(1,2);
+    
+    double dx = u - observed.x;
+    double dy = v - observed.y;
+    
+    return std::sqrt(dx*dx + dy*dy);
+}
+
+/**
+ * @brief Compute median of a vector of doubles.
+ */
+double computeMedian(std::vector<double>& values)
+{
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
 }
 
 /**
@@ -879,13 +955,18 @@ int main(int argc, char** argv)
             keyframeIndices.push_back(static_cast<int>(frameIdx));
             keypointToPointIdx.push_back(std::vector<int>(currKpts.size(), -1));
             
-            // Compute global pose
+            // Compute global pose (preliminary, will be scaled)
             CameraPose newPose;
             newPose.R = R * poses[lastKeyframeIdx].R;
-            newPose.t = R * poses[lastKeyframeIdx].t + t;
+            newPose.t = R * poses[lastKeyframeIdx].t + t;  // t has unit norm
             poses.push_back(newPose);
             
             // === TRIANGULATE AND MERGE MAP POINTS ===
+            // Compute camera centers for parallax check
+            cv::Mat C1 = -poses[lastKeyframeIdx].R.t() * poses[lastKeyframeIdx].t;
+            cv::Mat C2 = -newPose.R.t() * newPose.t;
+            double baseline = cv::norm(C2 - C1);
+            
             // Build projection matrices
             cv::Mat P1(3, 4, CV_64F), P2(3, 4, CV_64F);
             cv::hconcat(poses[lastKeyframeIdx].R, poses[lastKeyframeIdx].t, P1);
@@ -913,12 +994,18 @@ int main(int argc, char** argv)
             
             int nTriangulated = 0;
             int nMerged = 0;
+            int nRejectedParallax = 0;
+            int nRejectedReproj = 0;
+            int nRejectedDepth = 0;
+            
+            // Collect depths for scale estimation (only from newly triangulated points)
+            std::vector<double> newPointDepths;
             
             for (int k = 0; k < points4D.cols; ++k)
             {
                 int matchIdx = inlierMatchIndices[k];
-                int kptIdx1 = matches[matchIdx].queryIdx;  // Keypoint index in last keyframe
-                int kptIdx2 = matches[matchIdx].trainIdx;  // Keypoint index in current frame
+                int kptIdx1 = matches[matchIdx].queryIdx;
+                int kptIdx2 = matches[matchIdx].trainIdx;
                 
                 cv::Mat col = points4D.col(k);
                 double w = col.at<float>(3, 0);
@@ -931,24 +1018,50 @@ int main(int argc, char** argv)
                 cv::Point3d Xw(X, Y, Z);
                 cv::Mat XwMat = (cv::Mat_<double>(3,1) << X, Y, Z);
                 
-                // Cheirality check
+                // Cheirality check - depth in both cameras must be positive
                 cv::Mat Xc1 = poses[lastKeyframeIdx].R * XwMat + poses[lastKeyframeIdx].t;
                 cv::Mat Xc2 = newPose.R * XwMat + newPose.t;
-                if (Xc1.at<double>(2) <= 0 || Xc2.at<double>(2) <= 0) continue;
+                double depth1 = Xc1.at<double>(2);
+                double depth2 = Xc2.at<double>(2);
                 
-                // Distance filter
-                if (cv::norm(XwMat) > 100.0) continue;
+                if (depth1 <= 0 || depth2 <= 0) {
+                    nRejectedDepth++;
+                    continue;
+                }
+                
+                // Depth range check (relative to baseline)
+                double relativeDepth = depth1 / baseline;
+                if (relativeDepth < MIN_DEPTH || relativeDepth > MAX_DEPTH) {
+                    nRejectedDepth++;
+                    continue;
+                }
+                
+                // Parallax angle check - ensures well-conditioned triangulation
+                double parallax = computeParallaxAngle(C1, C2, Xw);
+                if (parallax < MIN_PARALLAX_DEG) {
+                    nRejectedParallax++;
+                    continue;
+                }
+                
+                // Reprojection error check
+                cv::Point2d obs1(inlierPts1[k].x, inlierPts1[k].y);
+                cv::Point2d obs2(inlierPts2[k].x, inlierPts2[k].y);
+                
+                double err1 = computeSingleReprojError(K, poses[lastKeyframeIdx], Xw, obs1);
+                double err2 = computeSingleReprojError(K, newPose, Xw, obs2);
+                
+                if (err1 > MAX_REPROJ_ERROR || err2 > MAX_REPROJ_ERROR) {
+                    nRejectedReproj++;
+                    continue;
+                }
                 
                 // === MAP POINT MERGING ===
-                // Check if the keypoint in the last keyframe already has an associated 3D point
                 int existingPointIdx = keypointToPointIdx[lastKeyframeIdx][kptIdx1];
                 
                 if (existingPointIdx != -1)
                 {
-                    // MERGE: This feature was already triangulated from an earlier pair
-                    // Just add an observation for the new keyframe to the existing point
-                    observations.push_back({newKeyframeIdx, existingPointIdx, 
-                                           cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                    // MERGE: Add observation to existing point
+                    observations.push_back({newKeyframeIdx, existingPointIdx, obs2});
                     keypointToPointIdx[newKeyframeIdx][kptIdx2] = existingPointIdx;
                     nMerged++;
                 }
@@ -958,18 +1071,22 @@ int main(int argc, char** argv)
                     int pointIndex = static_cast<int>(all3DPoints.size());
                     all3DPoints.push_back(Xw);
                     
-                    observations.push_back({lastKeyframeIdx, pointIndex, 
-                                           cv::Point2d(inlierPts1[k].x, inlierPts1[k].y)});
-                    observations.push_back({newKeyframeIdx, pointIndex, 
-                                           cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                    observations.push_back({lastKeyframeIdx, pointIndex, obs1});
+                    observations.push_back({newKeyframeIdx, pointIndex, obs2});
                     
                     keypointToPointIdx[lastKeyframeIdx][kptIdx1] = pointIndex;
                     keypointToPointIdx[newKeyframeIdx][kptIdx2] = pointIndex;
                     nTriangulated++;
+                    
+                    // Store depth for scale estimation
+                    newPointDepths.push_back(depth1);
                 }
             }
             
-            std::cout << "  New points: " << nTriangulated << ", Merged: " << nMerged << std::endl;
+            std::cout << "  New: " << nTriangulated << ", Merged: " << nMerged 
+                      << " (rejected: parallax=" << nRejectedParallax 
+                      << ", reproj=" << nRejectedReproj 
+                      << ", depth=" << nRejectedDepth << ")" << std::endl;
             
             // Update last keyframe
             lastKeyframeIdx = newKeyframeIdx;
@@ -1164,7 +1281,121 @@ int main(int argc, char** argv)
         double errAfter = computeReprojectionError(K, poses, all3DPoints, observations);
         std::cout << "\nReprojection error AFTER BA: " << errAfter << " px" << std::endl;
         
-        // --- 6. Save to OBJ --------------------------------------------------
+        // --- 6. Outlier Removal ----------------------------------------------
+        // Remove points with high reprojection error or behind cameras
+        
+        std::cout << "\n=== Outlier Removal ===" << std::endl;
+        
+        // Compute per-point maximum reprojection error and check if behind any camera
+        std::vector<bool> pointIsOutlier(all3DPoints.size(), false);
+        std::vector<double> pointMaxError(all3DPoints.size(), 0.0);
+        
+        for (const auto& obs : observations)
+        {
+            const CameraPose& pose = poses[obs.camIndex];
+            const cv::Point3d& X = all3DPoints[obs.pointIndex];
+            
+            // Check if behind camera
+            cv::Mat Xw = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
+            cv::Mat Xc = pose.R * Xw + pose.t;
+            if (Xc.at<double>(2) <= 0) {
+                pointIsOutlier[obs.pointIndex] = true;
+                continue;
+            }
+            
+            // Compute reprojection error
+            double err = computeSingleReprojError(K, pose, X, obs.pixel);
+            pointMaxError[obs.pointIndex] = std::max(pointMaxError[obs.pointIndex], err);
+            
+            if (err > OUTLIER_REPROJ_THRESHOLD) {
+                pointIsOutlier[obs.pointIndex] = true;
+            }
+        }
+        
+        // Also mark points that are too far from the camera cluster
+        // Compute centroid of camera centers
+        cv::Mat centroid = cv::Mat::zeros(3, 1, CV_64F);
+        int validCamCount = 0;
+        for (const auto& pose : poses) {
+            if (!pose.R.empty()) {
+                cv::Mat C = -pose.R.t() * pose.t;
+                centroid += C;
+                validCamCount++;
+            }
+        }
+        if (validCamCount > 0) centroid /= validCamCount;
+        
+        // Compute max camera distance from centroid
+        double maxCamDist = 0;
+        for (const auto& pose : poses) {
+            if (!pose.R.empty()) {
+                cv::Mat C = -pose.R.t() * pose.t;
+                maxCamDist = std::max(maxCamDist, cv::norm(C - centroid));
+            }
+        }
+        
+        // Mark points too far from centroid (> 5x the camera spread)
+        double distanceThreshold = std::max(10.0, maxCamDist * 5.0);
+        for (size_t i = 0; i < all3DPoints.size(); ++i)
+        {
+            cv::Mat Xm = (cv::Mat_<double>(3,1) << all3DPoints[i].x, all3DPoints[i].y, all3DPoints[i].z);
+            double dist = cv::norm(Xm - centroid);
+            if (dist > distanceThreshold) {
+                pointIsOutlier[i] = true;
+            }
+        }
+        
+        // Count outliers
+        int nOutliers = 0;
+        for (bool isOut : pointIsOutlier) {
+            if (isOut) nOutliers++;
+        }
+        
+        std::cout << "  Outliers detected: " << nOutliers << " / " << all3DPoints.size() 
+                  << " (" << std::setprecision(1) << std::fixed 
+                  << 100.0 * nOutliers / all3DPoints.size() << "%)" << std::endl;
+        std::cout << "  Distance threshold: " << distanceThreshold << std::endl;
+        
+        // Create filtered point cloud and remap observations
+        std::vector<cv::Point3d> filteredPoints;
+        std::vector<int> oldToNewIdx(all3DPoints.size(), -1);
+        
+        for (size_t i = 0; i < all3DPoints.size(); ++i)
+        {
+            if (!pointIsOutlier[i]) {
+                oldToNewIdx[i] = static_cast<int>(filteredPoints.size());
+                filteredPoints.push_back(all3DPoints[i]);
+            }
+        }
+        
+        // Remap observations
+        std::vector<Observation> filteredObs;
+        for (const auto& obs : observations)
+        {
+            int newIdx = oldToNewIdx[obs.pointIndex];
+            if (newIdx != -1) {
+                filteredObs.push_back({obs.camIndex, newIdx, obs.pixel});
+            }
+        }
+        
+        std::cout << "  Points after filtering: " << filteredPoints.size() << std::endl;
+        std::cout << "  Observations after filtering: " << filteredObs.size() << std::endl;
+        
+        // Replace with filtered data
+        all3DPoints = std::move(filteredPoints);
+        observations = std::move(filteredObs);
+        
+        // Run BA again on filtered data
+        std::cout << "\n=== Final Bundle Adjustment ===" << std::endl;
+        double errFiltered = computeReprojectionError(K, poses, all3DPoints, observations);
+        std::cout << "Reprojection error after filtering: " << errFiltered << " px" << std::endl;
+        
+        alternatingBundleAdjustment(K, poses, all3DPoints, observations, 3);
+        
+        double errFinal = computeReprojectionError(K, poses, all3DPoints, observations);
+        std::cout << "\nFINAL reprojection error: " << errFinal << " px" << std::endl;
+        
+        // --- 7. Save to OBJ --------------------------------------------------
 
         // Save with timestamp
         std::string timestamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
