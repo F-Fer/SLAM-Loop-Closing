@@ -773,6 +773,13 @@ int main(int argc, char** argv)
         std::vector<cv::Point3d> all3DPoints; // aggregated 3D points from all pairs
         std::vector<Observation> observations;
         
+        // Track which keypoint in which frame corresponds to which 3D point index
+        // keypointToPointIdx[camIdx][keypointIdx] = point3DIdx (or -1)
+        std::vector<std::vector<int>> keypointToPointIdx(numViews);
+        for(int i=0; i<numViews; ++i) {
+            keypointToPointIdx[i].assign(allKeypoints[i].size(), -1);
+        }
+        
         // Use a while loop to allow dynamic skipping of frames
         int i = 0; // Index of the current reference frame (camera 1)
         int j = 1; // Index of the candidate frame (camera 2)
@@ -891,6 +898,23 @@ int main(int argc, char** argv)
 
                 observations.push_back({i, pointIndex, cv::Point2d(inlierPts1[k].x, inlierPts1[k].y)});
                 observations.push_back({j, pointIndex, cv::Point2d(inlierPts2[k].x, inlierPts2[k].y)});
+                
+                // Update keypointToPointIdx map
+                // We need to find the original indices in allKeypoints.
+                // 'pts1' was built from matches[k].queryIdx
+                // 'pts2' was built from matches[k].trainIdx
+                // However, we filtered matches by inlierMask.
+                // We must re-trace the index.
+                
+                // The k-th inlier corresponds to the k-th element in pts1/pts2 (which we iterated over).
+                // Wait, the loop above iterates `k < pts1.size()`.
+                // pts1[k] came from matches[k].
+                
+                int originalIdx1 = matches[k].queryIdx;
+                int originalIdx2 = matches[k].trainIdx;
+                
+                keypointToPointIdx[i][originalIdx1] = pointIndex;
+                keypointToPointIdx[j][originalIdx2] = pointIndex;
             }
             
             std::cout << "  Triangulated " << nTriangulated << " points." << std::endl;
@@ -900,7 +924,96 @@ int main(int argc, char** argv)
             j = i + 1;
         }
 
-        // --- 6. Report results ----------------------------------------------
+        // --- 6. Loop Closure ------------------------------------------------
+        
+        std::cout << "\n=== Starting Loop Closure Detection ===" << std::endl;
+        int loopClosuresFound = 0;
+        int loopGap = 50; // Increased gap to prevent short-term loops (tracking)
+        
+        // We iterate through all frames and check for loops against past frames
+        for (int curr = 0; curr < numViews; ++curr)
+        {
+            // Skip invalid poses
+            if (poses[curr].R.empty()) continue;
+
+            int bestPastFrame = -1;
+            int maxInliers = -1;
+            std::vector<cv::DMatch> bestMatches;
+            cv::Mat bestMask;
+
+            for (int past = 0; past < curr - loopGap; ++past)
+            {
+                if (poses[past].R.empty()) continue;
+
+                // Simple check: Only match if we have enough features
+                if (allDescriptors[curr].rows < 100 || allDescriptors[past].rows < 100) continue;
+
+                // Match features
+                std::vector<cv::DMatch> matches;
+                matchFeatures(allDescriptors[curr], allDescriptors[past], matches, 0.75); // Stricter ratio test
+
+                if (matches.size() < 200) continue; // Stronger threshold for match count
+
+                // Geometric verification using Essential Matrix
+                std::vector<cv::Point2f> ptsCurr, ptsPast;
+                extractMatchedPoints(allKeypoints[curr], allKeypoints[past], matches, ptsCurr, ptsPast);
+
+                cv::Mat mask;
+                cv::Mat E = cv::findEssentialMat(ptsCurr, ptsPast, K, cv::RANSAC, 0.999, 1.0, mask);
+                
+                int inliers = cv::countNonZero(mask);
+                
+                // Heuristic: Must have substantial inliers AND high inlier ratio
+                // This filters out "lots of matches but geometrically inconsistent" (repetitive textures)
+                double inlierRatio = (double)inliers / matches.size();
+
+                if (inliers > 100 && inlierRatio > 0.5) 
+                {
+                    if (inliers > maxInliers) {
+                        maxInliers = inliers;
+                        bestPastFrame = past;
+                        bestMatches = matches;
+                        bestMask = mask;
+                    }
+                }
+            }
+
+            // Only add the BEST loop closure for this frame to avoid overwhelming the optimizer
+            if (bestPastFrame != -1)
+            {
+                std::cout << "  Loop detected: Frame " << curr << " <-> Frame " << bestPastFrame 
+                          << " (" << maxInliers << " inliers)" << std::endl;
+                loopClosuresFound++;
+
+                // Add observations
+                for (size_t k = 0; k < bestMatches.size(); ++k)
+                {
+                    if (!bestMask.at<uchar>(static_cast<int>(k))) continue;
+
+                    int idxCurr = bestMatches[k].queryIdx;
+                    int idxPast = bestMatches[k].trainIdx;
+
+                    int pointIdx = keypointToPointIdx[bestPastFrame][idxPast];
+                    
+                    // If the past frame sees a known 3D point
+                    if (pointIdx != -1)
+                    {
+                        // Add observation for current frame to this EXISTING point
+                        observations.push_back({curr, pointIdx, allKeypoints[curr][idxCurr].pt});
+                        
+                        // Also mark this keypoint in curr as associated with pointIdx
+                        // WARNING: If this keypoint was ALREADY assigned to a sequential point, 
+                        // we are effectively merging them. This is desired for loop closure, 
+                        // but can be risky if the match is wrong.
+                        keypointToPointIdx[curr][idxCurr] = pointIdx;
+                    }
+                }
+            }
+        }
+        std::cout << "Total loop closures found: " << loopClosuresFound << std::endl;
+
+
+        // --- 7. Report results ----------------------------------------------
 
         std::cout << "\n=== Reconstruction Summary ===" << std::endl;
         std::cout << "Number of views: " << numViews << std::endl;
