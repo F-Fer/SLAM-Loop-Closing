@@ -22,7 +22,7 @@ int main() {
     std::vector<std::vector<cv::Point2f>> imagePoints;
 
     // Load calibration images from the directory
-    std::string path = "../data/calibration/*.jpeg";
+    std::string path = "../data/calibration/*.png";
     std::vector<cv::String> imageFiles;
     cv::glob(path, imageFiles);
 

@@ -13,16 +13,18 @@
 namespace fs = std::filesystem;
 
 int SKIP_FRAMES = 5;
+std::string VIDEO_FILENAME = "IMG_0277.MOV";
 
-int extract_images() {
-    std::string video_path = "data/IMG_0243.MOV";
+int extract_images(std::string video_filename) {
+    std::string video_path = "data/" + video_filename;
     if (!fs::exists(video_path)) {
-        video_path = "../data/IMG_0243.MOV";
+        video_path = "../data/" + video_filename;
     }
     
-    std::string output_dir = "data/extracted_frames";
+    std::string video_name = video_filename.substr(0, video_filename.find('.'));
+    std::string output_dir = "data/extracted_frames/" + video_name;
     if (!fs::exists("data") && fs::exists("../data")) {
-        output_dir = "../data/extracted_frames";
+        output_dir = "../data/extracted_frames/" + video_name;
     }
 
     std::cout << "Starting image extraction from: " << video_path << std::endl;
@@ -370,7 +372,7 @@ int loop_closing() {
 }
 
 int main() {
-    // extract_images();
+    //extract_images("IMG_0276.MOV");
     loop_closing();
     return 0;
 }

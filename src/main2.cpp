@@ -30,6 +30,8 @@
 namespace fs = std::filesystem;
 
 int SKIP_FRAMES = 10;
+std::string VIDEO_FILENAME = "IMG_0277.MOV";
+
 
 struct CameraPose
 {
@@ -589,6 +591,12 @@ void saveAsOBJ(
     // Camera center C = -R^T * t
     for (size_t i = 0; i < poses.size(); ++i)
     {
+        if (poses[i].R.empty() || poses[i].t.empty())
+        {
+            std::cerr << "Warning: Skipping camera " << i << " (invalid pose) in OBJ export." << std::endl;
+            continue;
+        }
+
         const cv::Mat R = poses[i].R;
         const cv::Mat t = poses[i].t;
 
@@ -603,6 +611,8 @@ void saveAsOBJ(
     out << "\n# Camera axes (Optional small lines)\n";
     for (size_t i = 0; i < poses.size(); ++i)
     {
+        if (poses[i].R.empty() || poses[i].t.empty()) continue;
+
         const cv::Mat R = poses[i].R;
         const cv::Mat t = poses[i].t;
 
@@ -638,10 +648,11 @@ int main(int argc, char** argv)
 {
     try
     {
+        std::string video_name = VIDEO_FILENAME.substr(0, VIDEO_FILENAME.find('.'));
         // Find the extracted frames directory
-        std::string extracted_frames_dir = "data/extracted_frames";
+        std::string extracted_frames_dir = "data/extracted_frames/" + video_name;
         if (!fs::exists(extracted_frames_dir)) {
-            extracted_frames_dir = "../data/extracted_frames";
+            extracted_frames_dir = "../data/extracted_frames/" + video_name;
             if (!fs::exists(extracted_frames_dir)) {
                 std::cerr << "Could not find extracted frames directory: " << extracted_frames_dir << std::endl;
                 return -1;
@@ -668,15 +679,17 @@ int main(int argc, char** argv)
         //
         // K must be double-precision for the code below.
         // Camera intrinsics + distortion from chessboard calibration
-        const double fx = 2278.314580683383;
-        const double fy = 2285.883046238368;
-        const double cx = 2165.251737468604;
-        const double cy = 2802.513071510824;
+        const double fx = 1762.753483943652;
+        const double fy = 1769.06216492707;
+        const double cx = 533.3593669233525;
+        const double cy = 954.1640910735737;
         cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
         cv::Mat distCoeffs = (cv::Mat_<double>(1, 5)
-            << 0.02048298766857351, -0.02612160068548943,
-            -0.002871001624427744, 0.005322895660974928,
-            0.04897595392479197);
+            << 0.3350700377460379, -2.751579717545341,
+            -0.001513356719501493, -0.0009902019587527879,
+            7.747737515737778);
+
+        
 
         // --- 2. Load input images -------------------------------------------
 
