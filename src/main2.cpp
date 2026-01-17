@@ -32,7 +32,7 @@
 namespace fs = std::filesystem;
 
 // === CONFIGURATION ===
-std::string VIDEO_FILENAME = "IMG_0280.MOV";
+std::string VIDEO_FILENAME = "IMG_0282.MOV";
 
 // Keyframe selection thresholds
 const double MIN_MEDIAN_DISPLACEMENT = 20.0;   // Minimum median pixel displacement for keyframe
@@ -50,6 +50,14 @@ const double MAX_DEPTH = 50.0;                 // Maximum depth (relative to bas
 // Outlier removal thresholds
 const double OUTLIER_REPROJ_THRESHOLD = 5.0;   // Remove points with reproj error > this after BA
 
+// Pose graph optimization
+enum class PoseGraphMethod {
+    SIMPLE_LINEAR,     // Simple linear interpolation of rotation error
+    GAUSS_NEWTON       // Full Gauss-Newton optimization on pose graph
+};
+const PoseGraphMethod POSE_GRAPH_METHOD = PoseGraphMethod::GAUSS_NEWTON;
+const int POSE_GRAPH_ITERATIONS = 20;          // Number of GN iterations for pose graph optimization
+
 
 struct CameraPose
 {
@@ -62,6 +70,19 @@ struct Observation
     int camIndex;        // index of camera (0..numViews-1)
     int pointIndex;      // index of 3D point in all3DPoints
     cv::Point2d pixel;   // observed pixel coordinates (u,v)
+};
+
+/**
+ * @brief Edge in the pose graph, representing a relative transformation constraint.
+ */
+struct PoseEdge
+{
+    int from;           // Index of source pose
+    int to;             // Index of target pose
+    cv::Mat R_rel;      // Relative rotation: R_to = R_rel * R_from
+    cv::Mat t_rel;      // Relative translation: t_to = R_rel * t_from + t_rel
+    double weight;      // Weight/confidence of this edge (higher = more trusted)
+    bool isLoopClosure; // True if this is a loop closure edge
 };
 
 // --- Utility functions --------------------------------------------------------
@@ -232,6 +253,242 @@ double computeMedian(std::vector<double>& values)
     if (values.empty()) return 0.0;
     std::sort(values.begin(), values.end());
     return values[values.size() / 2];
+}
+
+/**
+ * @brief Compute the rotation error between two rotations in axis-angle representation.
+ * Returns the angle in radians.
+ */
+double rotationError(const cv::Mat& R1, const cv::Mat& R2)
+{
+    cv::Mat R_diff = R1 * R2.t();
+    cv::Mat rvec;
+    cv::Rodrigues(R_diff, rvec);
+    return cv::norm(rvec);
+}
+
+/**
+ * @brief Pose Graph Optimizer using Gauss-Newton.
+ * 
+ * Optimizes camera poses given a set of relative pose constraints (edges).
+ * The first pose is held fixed as the reference frame.
+ * 
+ * Each pose is parameterized as 6 DoF: [rx, ry, rz, tx, ty, tz]
+ * where (rx, ry, rz) is the Rodrigues rotation vector.
+ * 
+ * The cost function minimizes:
+ *   sum over edges: weight * ||log(R_rel^T * R_to * R_from^T)||^2 + weight * ||t_error||^2
+ */
+void optimizePoseGraph(
+    std::vector<CameraPose>& poses,
+    const std::vector<PoseEdge>& edges,
+    int maxIterations = 20)
+{
+    const int numPoses = static_cast<int>(poses.size());
+    if (numPoses < 2 || edges.empty()) return;
+    
+    // 6 DoF per pose, but pose 0 is fixed
+    const int numParams = (numPoses - 1) * 6;
+    
+    std::cout << "  Pose graph optimization: " << numPoses << " poses, " 
+              << edges.size() << " edges" << std::endl;
+    
+    // Convert poses to parameter vector (skip pose 0 which is fixed)
+    auto posesToParams = [&](std::vector<double>& params) {
+        params.resize(numParams);
+        for (int i = 1; i < numPoses; ++i) {
+            if (poses[i].R.empty()) {
+                // Invalid pose - initialize to identity
+                for (int j = 0; j < 6; ++j) params[(i-1)*6 + j] = 0.0;
+            } else {
+                cv::Mat rvec;
+                cv::Rodrigues(poses[i].R, rvec);
+                params[(i-1)*6 + 0] = rvec.at<double>(0);
+                params[(i-1)*6 + 1] = rvec.at<double>(1);
+                params[(i-1)*6 + 2] = rvec.at<double>(2);
+                params[(i-1)*6 + 3] = poses[i].t.at<double>(0);
+                params[(i-1)*6 + 4] = poses[i].t.at<double>(1);
+                params[(i-1)*6 + 5] = poses[i].t.at<double>(2);
+            }
+        }
+    };
+    
+    auto paramsToPoses = [&](const std::vector<double>& params) {
+        for (int i = 1; i < numPoses; ++i) {
+            cv::Mat rvec = (cv::Mat_<double>(3,1) << 
+                params[(i-1)*6 + 0], params[(i-1)*6 + 1], params[(i-1)*6 + 2]);
+            cv::Rodrigues(rvec, poses[i].R);
+            poses[i].t = (cv::Mat_<double>(3,1) << 
+                params[(i-1)*6 + 3], params[(i-1)*6 + 4], params[(i-1)*6 + 5]);
+        }
+    };
+    
+    // Get pose R and t from params (handling pose 0 specially)
+    auto getPose = [&](const std::vector<double>& params, int idx, cv::Mat& R, cv::Mat& t) {
+        if (idx == 0) {
+            R = poses[0].R.clone();
+            t = poses[0].t.clone();
+        } else {
+            cv::Mat rvec = (cv::Mat_<double>(3,1) << 
+                params[(idx-1)*6 + 0], params[(idx-1)*6 + 1], params[(idx-1)*6 + 2]);
+            cv::Rodrigues(rvec, R);
+            t = (cv::Mat_<double>(3,1) << 
+                params[(idx-1)*6 + 3], params[(idx-1)*6 + 4], params[(idx-1)*6 + 5]);
+        }
+    };
+    
+    std::vector<double> params;
+    posesToParams(params);
+    
+    const double eps = 1e-6;
+    
+    for (int iter = 0; iter < maxIterations; ++iter)
+    {
+        // Compute residuals and Jacobian numerically
+        const int numResiduals = static_cast<int>(edges.size()) * 6; // 3 for rotation, 3 for translation per edge
+        
+        cv::Mat residuals(numResiduals, 1, CV_64F);
+        cv::Mat J(numResiduals, numParams, CV_64F, cv::Scalar(0));
+        
+        // Compute residuals for current params
+        auto computeResiduals = [&](const std::vector<double>& p, cv::Mat& r) {
+            int rIdx = 0;
+            for (const auto& edge : edges)
+            {
+                cv::Mat R_from, t_from, R_to, t_to;
+                getPose(p, edge.from, R_from, t_from);
+                getPose(p, edge.to, R_to, t_to);
+                
+                // Expected: R_to = R_rel * R_from, t_to = R_rel * t_from + t_rel
+                // Error rotation: R_err = R_rel^T * R_to * R_from^T
+                cv::Mat R_expected = edge.R_rel * R_from;
+                cv::Mat R_err = R_expected.t() * R_to;
+                
+                cv::Mat rvec_err;
+                cv::Rodrigues(R_err, rvec_err);
+                
+                // Error translation
+                cv::Mat t_expected = edge.R_rel * t_from + edge.t_rel;
+                cv::Mat t_err = t_to - t_expected;
+                
+                double w = std::sqrt(edge.weight);
+                
+                r.at<double>(rIdx + 0) = w * rvec_err.at<double>(0);
+                r.at<double>(rIdx + 1) = w * rvec_err.at<double>(1);
+                r.at<double>(rIdx + 2) = w * rvec_err.at<double>(2);
+                r.at<double>(rIdx + 3) = w * t_err.at<double>(0);
+                r.at<double>(rIdx + 4) = w * t_err.at<double>(1);
+                r.at<double>(rIdx + 5) = w * t_err.at<double>(2);
+                
+                rIdx += 6;
+            }
+        };
+        
+        computeResiduals(params, residuals);
+        
+        double cost = residuals.dot(residuals);
+        
+        // Numeric Jacobian
+        for (int j = 0; j < numParams; ++j)
+        {
+            std::vector<double> params_plus = params;
+            std::vector<double> params_minus = params;
+            params_plus[j] += eps;
+            params_minus[j] -= eps;
+            
+            cv::Mat r_plus(numResiduals, 1, CV_64F);
+            cv::Mat r_minus(numResiduals, 1, CV_64F);
+            
+            computeResiduals(params_plus, r_plus);
+            computeResiduals(params_minus, r_minus);
+            
+            cv::Mat col = (r_plus - r_minus) / (2 * eps);
+            col.copyTo(J.col(j));
+        }
+        
+        // Gauss-Newton: H * dp = -g where H = J^T * J, g = J^T * r
+        cv::Mat H = J.t() * J;
+        cv::Mat g = J.t() * residuals;
+        
+        // Add damping (Levenberg-Marquardt style)
+        double lambda = 1e-4 * cv::trace(H)[0] / numParams;
+        for (int k = 0; k < numParams; ++k)
+            H.at<double>(k, k) += lambda;
+        
+        cv::Mat dp;
+        bool ok = cv::solve(H, -g, dp, cv::DECOMP_CHOLESKY);
+        if (!ok) {
+            std::cout << "  PGO iteration " << iter << ": solve failed" << std::endl;
+            break;
+        }
+        
+        // Update params
+        double maxUpdate = 0;
+        for (int k = 0; k < numParams; ++k) {
+            params[k] += dp.at<double>(k);
+            maxUpdate = std::max(maxUpdate, std::abs(dp.at<double>(k)));
+        }
+        
+        if (iter % 5 == 0 || iter == maxIterations - 1) {
+            std::cout << "  PGO iteration " << iter << ": cost=" << std::scientific 
+                      << cost << ", maxUpdate=" << maxUpdate << std::endl;
+        }
+        
+        if (maxUpdate < 1e-6) {
+            std::cout << "  PGO converged at iteration " << iter << std::endl;
+            break;
+        }
+    }
+    
+    // Write back optimized poses
+    paramsToPoses(params);
+}
+
+/**
+ * @brief Simple linear pose correction (original method).
+ * Distributes rotation error linearly along the trajectory.
+ */
+void simplePoseCorrection(
+    std::vector<CameraPose>& poses,
+    int loopFrameIdx,
+    int pastFrameIdx,
+    const cv::Mat& R_loop,
+    const cv::Mat& /* t_loop - unused due to scale ambiguity */)
+{
+    cv::Mat R_past = poses[pastFrameIdx].R;
+    cv::Mat t_past = poses[pastFrameIdx].t;
+    cv::Mat R_curr = poses[loopFrameIdx].R;
+    
+    // Sequential relative pose
+    cv::Mat R_seq = R_curr * R_past.t();
+    
+    // Rotation error
+    cv::Mat R_err = R_loop * R_seq.t();
+    cv::Mat rvec_err;
+    cv::Rodrigues(R_err, rvec_err);
+    
+    double angleErr = cv::norm(rvec_err);
+    std::cout << "  Rotation drift: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+    
+    // Distribute error linearly
+    int numFramesToCorrect = loopFrameIdx - pastFrameIdx;
+    std::cout << "  Correcting poses for frames " << (pastFrameIdx + 1) 
+              << " to " << loopFrameIdx << std::endl;
+    
+    for (int f = pastFrameIdx + 1; f <= loopFrameIdx; ++f)
+    {
+        if (poses[f].R.empty()) continue;
+        
+        double alpha = (double)(f - pastFrameIdx) / numFramesToCorrect;
+        
+        cv::Mat rvec_correction = alpha * rvec_err;
+        cv::Mat R_correction;
+        cv::Rodrigues(rvec_correction, R_correction);
+        
+        poses[f].R = R_correction * poses[f].R;
+    }
+    
+    std::cout << "  Simple pose correction applied." << std::endl;
 }
 
 /**
@@ -1169,54 +1426,70 @@ int main(int argc, char** argv)
                       << " <-> Frame " << globalBestPastFrame 
                       << " (" << globalMaxInliers << " inliers)" << std::endl;
             
-            // === POSE GRAPH CORRECTION ===
-            // Compute the expected relative pose from sequential tracking
-            cv::Mat R_past = poses[globalBestPastFrame].R;
-            cv::Mat t_past = poses[globalBestPastFrame].t;
-            cv::Mat R_curr = poses[globalBestCurrFrame].R;
-            cv::Mat t_curr = poses[globalBestCurrFrame].t;
-            
-            // Sequential relative pose: R_curr_from_past = R_curr * R_past^T
-            cv::Mat R_seq = R_curr * R_past.t();
-            cv::Mat t_seq = t_curr - R_seq * t_past;
-            
-            // Loop closure relative pose: globalBestR, globalBestT
-            // This is the pose of curr relative to past from direct matching
-            
-            // Rotation error between sequential and loop closure
-            cv::Mat R_err = globalBestR * R_seq.t();
-            cv::Mat rvec_err;
-            cv::Rodrigues(R_err, rvec_err);
-            
-            // Translation error (approximate - scale ambiguity exists)
-            // We only correct rotation, as translation scale is ambiguous in monocular
-            double angleErr = cv::norm(rvec_err);
-            std::cout << "  Rotation drift: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
-            
-            // Distribute rotation error linearly from past+1 to curr
-            int numFramesToCorrect = globalBestCurrFrame - globalBestPastFrame;
-            std::cout << "  Correcting poses for frames " << (globalBestPastFrame + 1) 
-                      << " to " << globalBestCurrFrame << std::endl;
-            
-            for (int f = globalBestPastFrame + 1; f <= globalBestCurrFrame; ++f)
+            // === POSE GRAPH OPTIMIZATION ===
+            if (POSE_GRAPH_METHOD == PoseGraphMethod::SIMPLE_LINEAR)
             {
-                if (poses[f].R.empty()) continue;
-                
-                double alpha = (double)(f - globalBestPastFrame) / numFramesToCorrect;
-                
-                // Interpolate rotation correction using scaled axis-angle
-                cv::Mat rvec_correction = alpha * rvec_err;
-                cv::Mat R_correction;
-                cv::Rodrigues(rvec_correction, R_correction);
-                
-                // Apply correction: R_new = R_correction * R_old
-                poses[f].R = R_correction * poses[f].R;
-                
-                // Note: We don't correct translation due to scale ambiguity
-                // The BA will handle small adjustments
+                std::cout << "  Using simple linear pose correction..." << std::endl;
+                simplePoseCorrection(poses, globalBestCurrFrame, globalBestPastFrame, 
+                                     globalBestR, globalBestT);
             }
-            
-            std::cout << "  Pose graph correction applied." << std::endl;
+            else // GAUSS_NEWTON
+            {
+                std::cout << "  Using Gauss-Newton pose graph optimization..." << std::endl;
+                
+                // Build pose graph with sequential edges
+                std::vector<PoseEdge> poseEdges;
+                
+                // Add sequential edges (odometry constraints)
+                for (int i = 1; i < numViews; ++i)
+                {
+                    if (poses[i-1].R.empty() || poses[i].R.empty()) continue;
+                    
+                    // Relative pose: R_i = R_rel * R_{i-1}, t_i = R_rel * t_{i-1} + t_rel
+                    cv::Mat R_rel = poses[i].R * poses[i-1].R.t();
+                    cv::Mat t_rel = poses[i].t - R_rel * poses[i-1].t;
+                    
+                    PoseEdge edge;
+                    edge.from = i - 1;
+                    edge.to = i;
+                    edge.R_rel = R_rel.clone();
+                    edge.t_rel = t_rel.clone();
+                    edge.weight = 1.0;  // Sequential edges have unit weight
+                    edge.isLoopClosure = false;
+                    poseEdges.push_back(edge);
+                }
+                
+                // Add loop closure edge
+                PoseEdge loopEdge;
+                loopEdge.from = globalBestPastFrame;
+                loopEdge.to = globalBestCurrFrame;
+                loopEdge.R_rel = globalBestR.clone();
+                loopEdge.t_rel = globalBestT.clone();
+                loopEdge.weight = 10.0;  // Loop closures have higher weight (more trusted)
+                loopEdge.isLoopClosure = true;
+                poseEdges.push_back(loopEdge);
+                
+                std::cout << "  Built pose graph: " << poseEdges.size() << " edges ("
+                          << (poseEdges.size() - 1) << " sequential + 1 loop closure)" << std::endl;
+                
+                // Compute rotation drift before optimization
+                cv::Mat R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
+                cv::Mat R_err = globalBestR * R_seq.t();
+                cv::Mat rvec_err;
+                cv::Rodrigues(R_err, rvec_err);
+                double angleErr = cv::norm(rvec_err);
+                std::cout << "  Rotation drift before PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+                
+                // Run pose graph optimization
+                optimizePoseGraph(poses, poseEdges, POSE_GRAPH_ITERATIONS);
+                
+                // Compute rotation drift after optimization
+                R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
+                R_err = globalBestR * R_seq.t();
+                cv::Rodrigues(R_err, rvec_err);
+                angleErr = cv::norm(rvec_err);
+                std::cout << "  Rotation drift after PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+            }
             
             // === ADD LOOP CLOSURE OBSERVATIONS ===
             int loopObsAdded = 0;
