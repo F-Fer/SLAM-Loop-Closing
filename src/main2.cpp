@@ -30,7 +30,7 @@
 
 namespace fs = std::filesystem;
 
-int SKIP_FRAMES = 10;
+int SKIP_FRAMES = 30;
 std::string VIDEO_FILENAME = "IMG_0280.MOV";
 
 
@@ -925,92 +925,151 @@ int main(int argc, char** argv)
         }
 
         // --- 6. Loop Closure ------------------------------------------------
+        // Find the SINGLE BEST loop closure across the entire trajectory
+        // Then correct pose drift before adding observations
         
         std::cout << "\n=== Starting Loop Closure Detection ===" << std::endl;
-        int loopClosuresFound = 0;
-        int loopGap = 50; // Increased gap to prevent short-term loops (tracking)
         
-        // We iterate through all frames and check for loops against past frames
-        for (int curr = 0; curr < numViews; ++curr)
+        int loopGap = numViews / 2; // Loop must span at least half the trajectory
+        
+        // Variables to track the globally best loop closure
+        int globalBestCurrFrame = -1;
+        int globalBestPastFrame = -1;
+        int globalMaxInliers = -1;
+        std::vector<cv::DMatch> globalBestMatches;
+        cv::Mat globalBestMask;
+        cv::Mat globalBestR, globalBestT;
+        
+        // Search for the single best loop closure
+        for (int curr = loopGap; curr < numViews; ++curr)
         {
-            // Skip invalid poses
             if (poses[curr].R.empty()) continue;
-
-            int bestPastFrame = -1;
-            int maxInliers = -1;
-            std::vector<cv::DMatch> bestMatches;
-            cv::Mat bestMask;
-
-            for (int past = 0; past < curr - loopGap; ++past)
+            
+            for (int past = 0; past <= curr - loopGap; ++past)
             {
                 if (poses[past].R.empty()) continue;
-
-                // Simple check: Only match if we have enough features
                 if (allDescriptors[curr].rows < 100 || allDescriptors[past].rows < 100) continue;
-
-                // Match features
+                
+                // Match features with stricter ratio test
                 std::vector<cv::DMatch> matches;
-                matchFeatures(allDescriptors[curr], allDescriptors[past], matches, 0.75); // Stricter ratio test
-
-                if (matches.size() < 200) continue; // Stronger threshold for match count
-
-                // Geometric verification using Essential Matrix
+                matchFeatures(allDescriptors[curr], allDescriptors[past], matches, 0.7);
+                
+                if (matches.size() < 300) continue; // High threshold for loop closure
+                
+                // Geometric verification
                 std::vector<cv::Point2f> ptsCurr, ptsPast;
                 extractMatchedPoints(allKeypoints[curr], allKeypoints[past], matches, ptsCurr, ptsPast);
-
+                
                 cv::Mat mask;
                 cv::Mat E = cv::findEssentialMat(ptsCurr, ptsPast, K, cv::RANSAC, 0.999, 1.0, mask);
                 
-                int inliers = cv::countNonZero(mask);
+                if (E.empty()) continue;
                 
-                // Heuristic: Must have substantial inliers AND high inlier ratio
-                // This filters out "lots of matches but geometrically inconsistent" (repetitive textures)
+                int inliers = cv::countNonZero(mask);
                 double inlierRatio = (double)inliers / matches.size();
-
-                if (inliers > 100 && inlierRatio > 0.5) 
+                
+                // Very strict criteria for loop closure
+                if (inliers > 200 && inlierRatio > 0.6 && inliers > globalMaxInliers)
                 {
-                    if (inliers > maxInliers) {
-                        maxInliers = inliers;
-                        bestPastFrame = past;
-                        bestMatches = matches;
-                        bestMask = mask;
-                    }
-                }
-            }
-
-            // Only add the BEST loop closure for this frame to avoid overwhelming the optimizer
-            if (bestPastFrame != -1)
-            {
-                std::cout << "  Loop detected: Frame " << curr << " <-> Frame " << bestPastFrame 
-                          << " (" << maxInliers << " inliers)" << std::endl;
-                loopClosuresFound++;
-
-                // Add observations
-                for (size_t k = 0; k < bestMatches.size(); ++k)
-                {
-                    if (!bestMask.at<uchar>(static_cast<int>(k))) continue;
-
-                    int idxCurr = bestMatches[k].queryIdx;
-                    int idxPast = bestMatches[k].trainIdx;
-
-                    int pointIdx = keypointToPointIdx[bestPastFrame][idxPast];
+                    // Recover relative pose
+                    cv::Mat R_loop, t_loop;
+                    int poseInliers = cv::recoverPose(E, ptsCurr, ptsPast, K, R_loop, t_loop, mask);
                     
-                    // If the past frame sees a known 3D point
-                    if (pointIdx != -1)
+                    if (poseInliers > 100)
                     {
-                        // Add observation for current frame to this EXISTING point
-                        observations.push_back({curr, pointIdx, allKeypoints[curr][idxCurr].pt});
-                        
-                        // Also mark this keypoint in curr as associated with pointIdx
-                        // WARNING: If this keypoint was ALREADY assigned to a sequential point, 
-                        // we are effectively merging them. This is desired for loop closure, 
-                        // but can be risky if the match is wrong.
-                        keypointToPointIdx[curr][idxCurr] = pointIdx;
+                        globalMaxInliers = inliers;
+                        globalBestCurrFrame = curr;
+                        globalBestPastFrame = past;
+                        globalBestMatches = matches;
+                        globalBestMask = mask.clone();
+                        globalBestR = R_loop.clone();
+                        globalBestT = t_loop.clone();
                     }
                 }
             }
         }
-        std::cout << "Total loop closures found: " << loopClosuresFound << std::endl;
+        
+        if (globalBestCurrFrame != -1)
+        {
+            std::cout << "  Best loop closure: Frame " << globalBestCurrFrame 
+                      << " <-> Frame " << globalBestPastFrame 
+                      << " (" << globalMaxInliers << " inliers)" << std::endl;
+            
+            // === POSE GRAPH CORRECTION ===
+            // Compute the expected relative pose from sequential tracking
+            cv::Mat R_past = poses[globalBestPastFrame].R;
+            cv::Mat t_past = poses[globalBestPastFrame].t;
+            cv::Mat R_curr = poses[globalBestCurrFrame].R;
+            cv::Mat t_curr = poses[globalBestCurrFrame].t;
+            
+            // Sequential relative pose: R_curr_from_past = R_curr * R_past^T
+            cv::Mat R_seq = R_curr * R_past.t();
+            cv::Mat t_seq = t_curr - R_seq * t_past;
+            
+            // Loop closure relative pose: globalBestR, globalBestT
+            // This is the pose of curr relative to past from direct matching
+            
+            // Rotation error between sequential and loop closure
+            cv::Mat R_err = globalBestR * R_seq.t();
+            cv::Mat rvec_err;
+            cv::Rodrigues(R_err, rvec_err);
+            
+            // Translation error (approximate - scale ambiguity exists)
+            // We only correct rotation, as translation scale is ambiguous in monocular
+            double angleErr = cv::norm(rvec_err);
+            std::cout << "  Rotation drift: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+            
+            // Distribute rotation error linearly from past+1 to curr
+            int numFramesToCorrect = globalBestCurrFrame - globalBestPastFrame;
+            std::cout << "  Correcting poses for frames " << (globalBestPastFrame + 1) 
+                      << " to " << globalBestCurrFrame << std::endl;
+            
+            for (int f = globalBestPastFrame + 1; f <= globalBestCurrFrame; ++f)
+            {
+                if (poses[f].R.empty()) continue;
+                
+                double alpha = (double)(f - globalBestPastFrame) / numFramesToCorrect;
+                
+                // Interpolate rotation correction using scaled axis-angle
+                cv::Mat rvec_correction = alpha * rvec_err;
+                cv::Mat R_correction;
+                cv::Rodrigues(rvec_correction, R_correction);
+                
+                // Apply correction: R_new = R_correction * R_old
+                poses[f].R = R_correction * poses[f].R;
+                
+                // Note: We don't correct translation due to scale ambiguity
+                // The BA will handle small adjustments
+            }
+            
+            std::cout << "  Pose graph correction applied." << std::endl;
+            
+            // === ADD LOOP CLOSURE OBSERVATIONS ===
+            int loopObsAdded = 0;
+            for (size_t k = 0; k < globalBestMatches.size(); ++k)
+            {
+                if (!globalBestMask.at<uchar>(static_cast<int>(k))) continue;
+                
+                int idxCurr = globalBestMatches[k].queryIdx;
+                int idxPast = globalBestMatches[k].trainIdx;
+                
+                int pointIdx = keypointToPointIdx[globalBestPastFrame][idxPast];
+                
+                if (pointIdx != -1)
+                {
+                    // Add observation linking current frame to existing 3D point
+                    observations.push_back({globalBestCurrFrame, pointIdx, 
+                                           cv::Point2d(allKeypoints[globalBestCurrFrame][idxCurr].pt)});
+                    keypointToPointIdx[globalBestCurrFrame][idxCurr] = pointIdx;
+                    loopObsAdded++;
+                }
+            }
+            std::cout << "  Added " << loopObsAdded << " loop closure observations." << std::endl;
+        }
+        else
+        {
+            std::cout << "  No loop closure detected (gap=" << loopGap << " frames)." << std::endl;
+        }
 
 
         // --- 7. Report results ----------------------------------------------
