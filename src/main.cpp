@@ -58,6 +58,9 @@ enum class PoseGraphMethod {
 const PoseGraphMethod POSE_GRAPH_METHOD = PoseGraphMethod::GAUSS_NEWTON;
 const int POSE_GRAPH_ITERATIONS = 20;          // Number of GN iterations for pose graph optimization
 
+// Loop closure settings
+const bool ENABLE_LOOP_CLOSURE = false;         // Set to false to disable loop closure detection
+
 
 struct CameraPose
 {
@@ -1577,163 +1580,170 @@ int main(int argc, char** argv)
         // Find the SINGLE BEST loop closure across the entire trajectory
         // Then correct pose drift before adding observations
         
-        std::cout << "\n=== Starting Loop Closure Detection ===" << std::endl;
-        
-        int loopGap = std::max(3, numViews / 2); // Loop must span at least half the trajectory
-        
-        // Variables to track the globally best loop closure
-        int globalBestCurrFrame = -1;
-        int globalBestPastFrame = -1;
-        int globalMaxInliers = -1;
-        std::vector<cv::DMatch> globalBestMatches;
-        cv::Mat globalBestMask;
-        cv::Mat globalBestR, globalBestT;
-        
-        // Search for the single best loop closure
-        for (int curr = loopGap; curr < numViews; ++curr)
+        if (ENABLE_LOOP_CLOSURE)
         {
-            if (poses[curr].R.empty()) continue;
+            std::cout << "\n=== Starting Loop Closure Detection ===" << std::endl;
             
-            for (int past = 0; past <= curr - loopGap; ++past)
+            int loopGap = std::max(3, numViews / 2); // Loop must span at least half the trajectory
+            
+            // Variables to track the globally best loop closure
+            int globalBestCurrFrame = -1;
+            int globalBestPastFrame = -1;
+            int globalMaxInliers = -1;
+            std::vector<cv::DMatch> globalBestMatches;
+            cv::Mat globalBestMask;
+            cv::Mat globalBestR, globalBestT;
+            
+            // Search for the single best loop closure
+            for (int curr = loopGap; curr < numViews; ++curr)
             {
-                if (poses[past].R.empty()) continue;
-                if (allDescriptors[curr].rows < 100 || allDescriptors[past].rows < 100) continue;
+                if (poses[curr].R.empty()) continue;
                 
-                // Match features with stricter ratio test
-                std::vector<cv::DMatch> matches;
-                matchFeatures(allDescriptors[curr], allDescriptors[past], matches, 0.7);
-                
-                if (matches.size() < 300) continue; // High threshold for loop closure
-                
-                // Geometric verification
-                std::vector<cv::Point2f> ptsCurr, ptsPast;
-                extractMatchedPoints(allKeypoints[curr], allKeypoints[past], matches, ptsCurr, ptsPast);
-                
-                cv::Mat mask;
-                cv::Mat E = cv::findEssentialMat(ptsCurr, ptsPast, K, cv::RANSAC, 0.999, 1.0, mask);
-                
-                if (E.empty()) continue;
-                
-                int inliers = cv::countNonZero(mask);
-                double inlierRatio = (double)inliers / matches.size();
-                
-                // Very strict criteria for loop closure
-                if (inliers > 200 && inlierRatio > 0.6 && inliers > globalMaxInliers)
+                for (int past = 0; past <= curr - loopGap; ++past)
                 {
-                    // Recover relative pose
-                    cv::Mat R_loop, t_loop;
-                    int poseInliers = cv::recoverPose(E, ptsCurr, ptsPast, K, R_loop, t_loop, mask);
+                    if (poses[past].R.empty()) continue;
+                    if (allDescriptors[curr].rows < 100 || allDescriptors[past].rows < 100) continue;
                     
-                    if (poseInliers > 100)
+                    // Match features with stricter ratio test
+                    std::vector<cv::DMatch> matches;
+                    matchFeatures(allDescriptors[curr], allDescriptors[past], matches, 0.7);
+                    
+                    if (matches.size() < 300) continue; // High threshold for loop closure
+                    
+                    // Geometric verification
+                    std::vector<cv::Point2f> ptsCurr, ptsPast;
+                    extractMatchedPoints(allKeypoints[curr], allKeypoints[past], matches, ptsCurr, ptsPast);
+                    
+                    cv::Mat mask;
+                    cv::Mat E = cv::findEssentialMat(ptsCurr, ptsPast, K, cv::RANSAC, 0.999, 1.0, mask);
+                    
+                    if (E.empty()) continue;
+                    
+                    int inliers = cv::countNonZero(mask);
+                    double inlierRatio = (double)inliers / matches.size();
+                    
+                    // Very strict criteria for loop closure
+                    if (inliers > 200 && inlierRatio > 0.6 && inliers > globalMaxInliers)
                     {
-                        globalMaxInliers = inliers;
-                        globalBestCurrFrame = curr;
-                        globalBestPastFrame = past;
-                        globalBestMatches = matches;
-                        globalBestMask = mask.clone();
-                        globalBestR = R_loop.clone();
-                        globalBestT = t_loop.clone();
+                        // Recover relative pose
+                        cv::Mat R_loop, t_loop;
+                        int poseInliers = cv::recoverPose(E, ptsCurr, ptsPast, K, R_loop, t_loop, mask);
+                        
+                        if (poseInliers > 100)
+                        {
+                            globalMaxInliers = inliers;
+                            globalBestCurrFrame = curr;
+                            globalBestPastFrame = past;
+                            globalBestMatches = matches;
+                            globalBestMask = mask.clone();
+                            globalBestR = R_loop.clone();
+                            globalBestT = t_loop.clone();
+                        }
                     }
                 }
             }
-        }
-        
-        if (globalBestCurrFrame != -1)
-        {
-            std::cout << "  Best loop closure: Frame " << globalBestCurrFrame 
-                      << " <-> Frame " << globalBestPastFrame 
-                      << " (" << globalMaxInliers << " inliers)" << std::endl;
             
-            // === POSE GRAPH OPTIMIZATION ===
-            if (POSE_GRAPH_METHOD == PoseGraphMethod::SIMPLE_LINEAR)
+            if (globalBestCurrFrame != -1)
             {
-                std::cout << "  Using simple linear pose correction..." << std::endl;
-                simplePoseCorrection(poses, globalBestCurrFrame, globalBestPastFrame, 
-                                     globalBestR, globalBestT);
-            }
-            else // GAUSS_NEWTON
-            {
-                std::cout << "  Using Gauss-Newton pose graph optimization..." << std::endl;
+                std::cout << "  Best loop closure: Frame " << globalBestCurrFrame 
+                          << " <-> Frame " << globalBestPastFrame 
+                          << " (" << globalMaxInliers << " inliers)" << std::endl;
                 
-                // Build pose graph with sequential edges
-                std::vector<PoseEdge> poseEdges;
-                
-                // Add sequential edges (odometry constraints)
-                for (int i = 1; i < numViews; ++i)
+                // === POSE GRAPH OPTIMIZATION ===
+                if (POSE_GRAPH_METHOD == PoseGraphMethod::SIMPLE_LINEAR)
                 {
-                    if (poses[i-1].R.empty() || poses[i].R.empty()) continue;
+                    std::cout << "  Using simple linear pose correction..." << std::endl;
+                    simplePoseCorrection(poses, globalBestCurrFrame, globalBestPastFrame, 
+                                         globalBestR, globalBestT);
+                }
+                else // GAUSS_NEWTON
+                {
+                    std::cout << "  Using Gauss-Newton pose graph optimization..." << std::endl;
                     
-                    // Relative pose: R_i = R_rel * R_{i-1}, t_i = R_rel * t_{i-1} + t_rel
-                    cv::Mat R_rel = poses[i].R * poses[i-1].R.t();
-                    cv::Mat t_rel = poses[i].t - R_rel * poses[i-1].t;
+                    // Build pose graph with sequential edges
+                    std::vector<PoseEdge> poseEdges;
                     
-                    PoseEdge edge;
-                    edge.from = i - 1;
-                    edge.to = i;
-                    edge.R_rel = R_rel.clone();
-                    edge.t_rel = t_rel.clone();
-                    edge.weight = 1.0;  // Sequential edges have unit weight
-                    edge.isLoopClosure = false;
-                    poseEdges.push_back(edge);
+                    // Add sequential edges (odometry constraints)
+                    for (int i = 1; i < numViews; ++i)
+                    {
+                        if (poses[i-1].R.empty() || poses[i].R.empty()) continue;
+                        
+                        // Relative pose: R_i = R_rel * R_{i-1}, t_i = R_rel * t_{i-1} + t_rel
+                        cv::Mat R_rel = poses[i].R * poses[i-1].R.t();
+                        cv::Mat t_rel = poses[i].t - R_rel * poses[i-1].t;
+                        
+                        PoseEdge edge;
+                        edge.from = i - 1;
+                        edge.to = i;
+                        edge.R_rel = R_rel.clone();
+                        edge.t_rel = t_rel.clone();
+                        edge.weight = 1.0;  // Sequential edges have unit weight
+                        edge.isLoopClosure = false;
+                        poseEdges.push_back(edge);
+                    }
+                    
+                    // Add loop closure edge
+                    PoseEdge loopEdge;
+                    loopEdge.from = globalBestPastFrame;
+                    loopEdge.to = globalBestCurrFrame;
+                    loopEdge.R_rel = globalBestR.clone();
+                    loopEdge.t_rel = globalBestT.clone();
+                    loopEdge.weight = 10.0;  // Loop closures have higher weight (more trusted)
+                    loopEdge.isLoopClosure = true;
+                    poseEdges.push_back(loopEdge);
+                    
+                    std::cout << "  Built pose graph: " << poseEdges.size() << " edges ("
+                              << (poseEdges.size() - 1) << " sequential + 1 loop closure)" << std::endl;
+                    
+                    // Compute rotation drift before optimization
+                    cv::Mat R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
+                    cv::Mat R_err = globalBestR * R_seq.t();
+                    cv::Mat rvec_err;
+                    cv::Rodrigues(R_err, rvec_err);
+                    double angleErr = cv::norm(rvec_err);
+                    std::cout << "  Rotation drift before PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+                    
+                    // Run pose graph optimization
+                    optimizePoseGraph(poses, poseEdges, POSE_GRAPH_ITERATIONS);
+                    
+                    // Compute rotation drift after optimization
+                    R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
+                    R_err = globalBestR * R_seq.t();
+                    cv::Rodrigues(R_err, rvec_err);
+                    angleErr = cv::norm(rvec_err);
+                    std::cout << "  Rotation drift after PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
                 }
                 
-                // Add loop closure edge
-                PoseEdge loopEdge;
-                loopEdge.from = globalBestPastFrame;
-                loopEdge.to = globalBestCurrFrame;
-                loopEdge.R_rel = globalBestR.clone();
-                loopEdge.t_rel = globalBestT.clone();
-                loopEdge.weight = 10.0;  // Loop closures have higher weight (more trusted)
-                loopEdge.isLoopClosure = true;
-                poseEdges.push_back(loopEdge);
-                
-                std::cout << "  Built pose graph: " << poseEdges.size() << " edges ("
-                          << (poseEdges.size() - 1) << " sequential + 1 loop closure)" << std::endl;
-                
-                // Compute rotation drift before optimization
-                cv::Mat R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
-                cv::Mat R_err = globalBestR * R_seq.t();
-                cv::Mat rvec_err;
-                cv::Rodrigues(R_err, rvec_err);
-                double angleErr = cv::norm(rvec_err);
-                std::cout << "  Rotation drift before PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
-                
-                // Run pose graph optimization
-                optimizePoseGraph(poses, poseEdges, POSE_GRAPH_ITERATIONS);
-                
-                // Compute rotation drift after optimization
-                R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
-                R_err = globalBestR * R_seq.t();
-                cv::Rodrigues(R_err, rvec_err);
-                angleErr = cv::norm(rvec_err);
-                std::cout << "  Rotation drift after PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
-            }
-            
-            // === ADD LOOP CLOSURE OBSERVATIONS ===
-            int loopObsAdded = 0;
-            for (size_t k = 0; k < globalBestMatches.size(); ++k)
-            {
-                if (!globalBestMask.at<uchar>(static_cast<int>(k))) continue;
-                
-                int idxCurr = globalBestMatches[k].queryIdx;
-                int idxPast = globalBestMatches[k].trainIdx;
-                
-                int pointIdx = keypointToPointIdx[globalBestPastFrame][idxPast];
-                
-                if (pointIdx != -1)
+                // === ADD LOOP CLOSURE OBSERVATIONS ===
+                int loopObsAdded = 0;
+                for (size_t k = 0; k < globalBestMatches.size(); ++k)
                 {
-                    // Add observation linking current frame to existing 3D point
-                    observations.push_back({globalBestCurrFrame, pointIdx, 
-                                           cv::Point2d(allKeypoints[globalBestCurrFrame][idxCurr].pt)});
-                    keypointToPointIdx[globalBestCurrFrame][idxCurr] = pointIdx;
-                    loopObsAdded++;
+                    if (!globalBestMask.at<uchar>(static_cast<int>(k))) continue;
+                    
+                    int idxCurr = globalBestMatches[k].queryIdx;
+                    int idxPast = globalBestMatches[k].trainIdx;
+                    
+                    int pointIdx = keypointToPointIdx[globalBestPastFrame][idxPast];
+                    
+                    if (pointIdx != -1)
+                    {
+                        // Add observation linking current frame to existing 3D point
+                        observations.push_back({globalBestCurrFrame, pointIdx, 
+                                               cv::Point2d(allKeypoints[globalBestCurrFrame][idxCurr].pt)});
+                        keypointToPointIdx[globalBestCurrFrame][idxCurr] = pointIdx;
+                        loopObsAdded++;
+                    }
                 }
+                std::cout << "  Added " << loopObsAdded << " loop closure observations." << std::endl;
             }
-            std::cout << "  Added " << loopObsAdded << " loop closure observations." << std::endl;
+            else
+            {
+                std::cout << "  No loop closure detected (gap=" << loopGap << " frames)." << std::endl;
+            }
         }
         else
         {
-            std::cout << "  No loop closure detected (gap=" << loopGap << " frames)." << std::endl;
+            std::cout << "\n=== Loop Closure Detection DISABLED ===" << std::endl;
         }
 
 
