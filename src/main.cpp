@@ -492,6 +492,96 @@ void simplePoseCorrection(
 }
 
 /**
+ * @brief Estimate camera pose from 2D-3D correspondences using PnP.
+ * 
+ * This gives us the pose directly in the map coordinate system,
+ * avoiding scale drift that occurs with essential matrix estimation.
+ * PnP maintains consistent scale because we're localizing against
+ * existing 3D points that already have proper scale.
+ * 
+ * @param K Camera intrinsic matrix.
+ * @param points2D 2D image points (in current frame).
+ * @param points3D Corresponding 3D world points (from existing map).
+ * @param R Output rotation matrix (world to camera).
+ * @param t Output translation vector (world to camera).
+ * @param inliers Output indices of inlier correspondences.
+ * @return true if pose estimation succeeded with enough inliers.
+ */
+bool estimatePoseFromPnP(
+    const cv::Mat& K,
+    const std::vector<cv::Point2f>& points2D,
+    const std::vector<cv::Point3d>& points3D,
+    cv::Mat& R,
+    cv::Mat& t,
+    std::vector<int>& inliers)
+{
+    const int MIN_PNP_INLIERS = 15;
+    
+    if (points2D.size() < 6 || points3D.size() < 6) {
+        return false;
+    }
+    
+    if (points2D.size() != points3D.size()) {
+        std::cerr << "PnP: mismatched 2D/3D point counts" << std::endl;
+        return false;
+    }
+    
+    cv::Mat rvec, tvec;
+    
+    bool success = cv::solvePnPRansac(
+        points3D,
+        points2D,
+        K,
+        cv::noArray(),  // No distortion (images already undistorted)
+        rvec,
+        tvec,
+        false,          // useExtrinsicGuess
+        300,            // iterationsCount
+        4.0,            // reprojectionError threshold (pixels)
+        0.99,           // confidence
+        inliers,
+        cv::SOLVEPNP_ITERATIVE
+    );
+    
+    if (!success || static_cast<int>(inliers.size()) < MIN_PNP_INLIERS) {
+        return false;
+    }
+    
+    // Refine with iterative PnP using only inliers
+    std::vector<cv::Point2f> inlierPts2D;
+    std::vector<cv::Point3d> inlierPts3D;
+    inlierPts2D.reserve(inliers.size());
+    inlierPts3D.reserve(inliers.size());
+    
+    for (int idx : inliers) {
+        inlierPts2D.push_back(points2D[idx]);
+        inlierPts3D.push_back(points3D[idx]);
+    }
+    
+    // Refine the pose estimate
+    cv::solvePnP(
+        inlierPts3D,
+        inlierPts2D,
+        K,
+        cv::noArray(),
+        rvec,
+        tvec,
+        true,  // useExtrinsicGuess - refine the RANSAC result
+        cv::SOLVEPNP_ITERATIVE
+    );
+    
+    // Convert rvec to rotation matrix
+    cv::Rodrigues(rvec, R);
+    t = tvec.clone();
+    
+    // Ensure proper types
+    R.convertTo(R, CV_64F);
+    t.convertTo(t, CV_64F);
+    
+    return true;
+}
+
+/**
  * @brief Detect SIFT features and compute descriptors for an image.
  */
 void detectAndDescribeSIFT(
@@ -1181,14 +1271,130 @@ int main(int argc, char** argv)
                 continue;
             }
             
-            // Estimate pose
+            // === POSE ESTIMATION ===
+            // Strategy: Try PnP first (if we have existing 3D map points), 
+            // fall back to essential matrix if not enough correspondences.
+            // PnP gives us absolute pose with consistent scale.
+            // Essential matrix gives relative pose with unit-norm translation (scale drift).
+            
             cv::Mat inlierMask, R, t;
-            if (!estimateRelativePoseFromEssential(K, pts1, pts2, R, t, inlierMask))
+            bool usedPnP = false;
+            int inlierCount = 0;
+            
+            // Collect 2D-3D correspondences from existing map points
+            std::vector<cv::Point2f> pts2DForPnP;
+            std::vector<cv::Point3d> pts3DForPnP;
+            std::vector<int> matchIndicesWithMap;  // Which matches have existing 3D points
+            
+            for (size_t k = 0; k < matches.size(); ++k)
             {
-                continue;
+                int kptIdx1 = matches[k].queryIdx;  // Index in last keyframe
+                int existingPointIdx = keypointToPointIdx[lastKeyframeIdx][kptIdx1];
+                
+                if (existingPointIdx != -1 && existingPointIdx < static_cast<int>(all3DPoints.size()))
+                {
+                    pts2DForPnP.push_back(currKpts[matches[k].trainIdx].pt);
+                    pts3DForPnP.push_back(all3DPoints[existingPointIdx]);
+                    matchIndicesWithMap.push_back(static_cast<int>(k));
+                }
             }
             
-            int inlierCount = cv::countNonZero(inlierMask);
+            const int MIN_POINTS_FOR_PNP = 25;  // Need enough 2D-3D correspondences
+            
+            // Try PnP if we have enough map point observations
+            if (pts2DForPnP.size() >= MIN_POINTS_FOR_PNP)
+            {
+                std::vector<int> pnpInliers;
+                cv::Mat R_pnp, t_pnp;
+                
+                if (estimatePoseFromPnP(K, pts2DForPnP, pts3DForPnP, R_pnp, t_pnp, pnpInliers))
+                {
+                    usedPnP = true;
+                    R = R_pnp;
+                    t = t_pnp;
+                    inlierCount = static_cast<int>(pnpInliers.size());
+                    
+                    // Create inlier mask for all matches
+                    // Mark PnP inliers, and also run essential matrix to identify
+                    // additional inliers among matches without existing 3D points
+                    inlierMask = cv::Mat::zeros(static_cast<int>(matches.size()), 1, CV_8U);
+                    
+                    // Mark PnP inliers
+                    for (int idx : pnpInliers) {
+                        int matchIdx = matchIndicesWithMap[idx];
+                        inlierMask.at<uchar>(matchIdx) = 1;
+                    }
+                    
+                    // For matches WITHOUT existing 3D points, verify geometrically
+                    // by checking reprojection with the estimated pose
+                    // This allows us to triangulate new points from these matches
+                    cv::Mat P_new(3, 4, CV_64F);
+                    cv::hconcat(R, t, P_new);
+                    P_new = K * P_new;
+                    
+                    cv::Mat P_prev(3, 4, CV_64F);
+                    cv::hconcat(poses[lastKeyframeIdx].R, poses[lastKeyframeIdx].t, P_prev);
+                    P_prev = K * P_prev;
+                    
+                    // Compute fundamental matrix from the two projection matrices
+                    // F = [e']_x * P' * P^+  (but we'll use epipolar constraint directly)
+                    for (size_t k = 0; k < matches.size(); ++k)
+                    {
+                        if (inlierMask.at<uchar>(static_cast<int>(k))) continue;  // Already marked
+                        
+                        int kptIdx1 = matches[k].queryIdx;
+                        if (keypointToPointIdx[lastKeyframeIdx][kptIdx1] != -1) continue;
+                        
+                        // Triangulate this point and check reprojection error
+                        cv::Mat pts4D;
+                        std::vector<cv::Point2f> p1 = {pts1[k]};
+                        std::vector<cv::Point2f> p2 = {pts2[k]};
+                        cv::triangulatePoints(P_prev, P_new, p1, p2, pts4D);
+                        
+                        double w = pts4D.at<float>(3, 0);
+                        if (std::abs(w) < 1e-9) continue;
+                        
+                        cv::Point3d X(
+                            pts4D.at<float>(0, 0) / w,
+                            pts4D.at<float>(1, 0) / w,
+                            pts4D.at<float>(2, 0) / w
+                        );
+                        
+                        // Check reprojection in both views
+                        double err1 = computeSingleReprojError(K, poses[lastKeyframeIdx], X, 
+                                                               cv::Point2d(pts1[k].x, pts1[k].y));
+                        
+                        CameraPose tempPose;
+                        tempPose.R = R;
+                        tempPose.t = t;
+                        double err2 = computeSingleReprojError(K, tempPose, X, 
+                                                               cv::Point2d(pts2[k].x, pts2[k].y));
+                        
+                        // Check depth positivity
+                        cv::Mat Xw = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
+                        cv::Mat Xc1 = poses[lastKeyframeIdx].R * Xw + poses[lastKeyframeIdx].t;
+                        cv::Mat Xc2 = R * Xw + t;
+                        
+                        if (Xc1.at<double>(2) > 0 && Xc2.at<double>(2) > 0 &&
+                            err1 < MAX_REPROJ_ERROR && err2 < MAX_REPROJ_ERROR)
+                        {
+                            inlierMask.at<uchar>(static_cast<int>(k)) = 1;
+                            inlierCount++;
+                        }
+                    }
+                }
+            }
+            
+            // Fall back to essential matrix if PnP failed or not enough map points
+            if (!usedPnP)
+            {
+                if (!estimateRelativePoseFromEssential(K, pts1, pts2, R, t, inlierMask))
+                {
+                    continue;
+                }
+                inlierCount = cv::countNonZero(inlierMask);
+            }
+            
             double inlierRatio = (double)inlierCount / matches.size();
             
             if (inlierCount < MIN_INLIERS_FOR_KEYFRAME || inlierRatio < MIN_INLIER_RATIO)
@@ -1203,6 +1409,7 @@ int main(int argc, char** argv)
                       << "disp=" << std::fixed << std::setprecision(1) << medianDisp << "px, "
                       << "matches=" << matches.size() << ", "
                       << "inliers=" << inlierCount << " (" << std::setprecision(0) << inlierRatio*100 << "%)"
+                      << (usedPnP ? " [PnP]" : " [Essential]")
                       << std::endl;
             
             // Store keyframe data
@@ -1212,10 +1419,21 @@ int main(int argc, char** argv)
             keyframeIndices.push_back(static_cast<int>(frameIdx));
             keypointToPointIdx.push_back(std::vector<int>(currKpts.size(), -1));
             
-            // Compute global pose (preliminary, will be scaled)
+            // Compute global pose
             CameraPose newPose;
-            newPose.R = R * poses[lastKeyframeIdx].R;
-            newPose.t = R * poses[lastKeyframeIdx].t + t;  // t has unit norm
+            if (usedPnP)
+            {
+                // PnP gives us the ABSOLUTE pose directly (with correct scale!)
+                newPose.R = R.clone();
+                newPose.t = t.clone();
+            }
+            else
+            {
+                // Essential matrix gives RELATIVE pose (unit-norm translation)
+                // Must compose with previous pose
+                newPose.R = R * poses[lastKeyframeIdx].R;
+                newPose.t = R * poses[lastKeyframeIdx].t + t;
+            }
             poses.push_back(newPose);
             
             // === TRIANGULATE AND MERGE MAP POINTS ===
