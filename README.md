@@ -10,10 +10,10 @@ This project implements a Loop Closing system for SLAM. The system identifies si
 
 ## Implementation Steps
 
-### ✅ 1. Recording a Suitable Video Sequence
+### 1. Recording a Suitable Video Sequence
 Multiple video sequences were recorded with an iPhone, where the camera returns to its starting position at the end (loop). The camera was calibrated beforehand.
 
-### ✅ 2. Sequential Feature Detection, Feature Matching, and Reconstruction
+### 2. Sequential Feature Detection, Feature Matching, and Reconstruction
 - **Feature Detection**: SIFT (Scale-Invariant Feature Transform) for robust feature detection
 - **Feature Matching**: FLANN-based matching with Lowe's Ratio Test (0.8)
 - **Keyframe Selection**: Dynamic selection based on parallax (20-150 pixel median displacement)
@@ -22,13 +22,13 @@ Multiple video sequences were recorded with an iPhone, where the camera returns 
   - Fallback: Essential Matrix for new scenes without 3D points
 - **Triangulation**: With quality checks (depth, parallax angle, reprojection error)
 
-### ✅ 3. Loop Closure Check After Each Frame
+### 3. Loop Closure Check After Each Frame
 After complete sequence processing, the **best** loop closure is searched:
 - Minimum gap: Half of the trajectory (prevents false positive detection)
 - Geometric verification with Essential Matrix (RANSAC)
 - Strict criteria: >200 inliers and >60% inlier ratio
 
-### ✅ 4. Re-matching and Reconstruction
+### 4. Re-matching and Reconstruction
 After loop closure detection:
 1. **Pose Graph Optimization**: Correction of drift (rotation + translation)
 2. **Re-Triangulation**: Recalculation of all 3D points with corrected poses
@@ -60,7 +60,7 @@ Tested on video `IMG_0282.MOV` (camera returns to starting position):
 | Rotation Drift | ~15-20° | ~0° | ~0° |
 | Translation Drift | ~2.5 units | ~0 units | ~0 units |
 | Reprojection Error | 2.8 px | 3.2 px | 3.1 px |
-| Loop Cameras Overlap | ❌ No | ✅ Yes | ✅ Yes |
+| Loop Cameras Overlap | No | Yes | Yes |
 
 ### Visual Comparison
 
