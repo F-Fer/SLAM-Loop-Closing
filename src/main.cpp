@@ -1,18 +1,13 @@
-// camera_reconstruction_sift_essential.cpp
+// main.cpp
 //
-// Minimal multi-view reconstruction demo using OpenCV:
+// SLAM Loop Closing System using OpenCV:
 // - SIFT feature matching between consecutive images
-// - Essential matrix estimation (known intrinsics K)
-// - Camera pose estimation (R, t) per view
-// - 3D point triangulation from inlier correspondences
-//
-// Build (example):
-//   g++ camera_reconstruction_sift_essential.cpp -o recon `pkg-config --cflags --libs opencv4`
-//
-// Run:
-//   ./recon img1.jpg img2.jpg img3.jpg ...
-//
-// Note: This is a research-style demo, not production code. No bundle adjustment.
+// - Keyframe selection based on parallax
+// - PnP pose estimation
+// - Triangulation with quality checks
+// - Loop closure detection
+// - Pose graph optimization
+// - Bundle adjustment
 
 #include "extract_images.hpp"
 #include <fstream>
@@ -512,18 +507,6 @@ void simplePoseCorrection(
     cv::Mat C_past = -R_past.t() * t_past;  // Camera center of past frame
     cv::Mat C_curr = -R_curr.t() * t_curr;  // Camera center of current frame (from odometry)
     
-    // For a TRUE loop closure, the camera has returned to (approximately) the same position.
-    // The translation from recoverPose() only gives DIRECTION, not magnitude.
-    // 
-    // Two options:
-    // 1. Use odometry scale (preserves trajectory shape but doesn't close the loop spatially)
-    // 2. Assume same position (closes the loop but may distort trajectory)
-    //
-    // For loop closure visualization, option 2 makes more sense - the camera returned
-    // to where it started, so Frame_curr should be at (approximately) the same position as Frame_past.
-    //
-    // We use the expected position = C_past (same position)
-    // This means we're correcting all the translation drift that accumulated.
     cv::Mat C_curr_expected = C_past.clone();  // Loop closure: camera returned to same position
     
     // Translation drift: difference between where curr IS and where it SHOULD BE
@@ -543,7 +526,6 @@ void simplePoseCorrection(
         // Linear interpolation factor (0 at pastFrame, 1 at loopFrame)
         double alpha = (double)(f - pastFrameIdx) / numFramesToCorrect;
         
-        // IMPORTANT: Get camera center BEFORE changing R
         // C = -R^T * t only works when R and t are consistent
         cv::Mat R_old = poses[f].R.clone();
         cv::Mat t_old = poses[f].t.clone();
@@ -575,11 +557,6 @@ void simplePoseCorrection(
 
 /**
  * @brief Estimate camera pose from 2D-3D correspondences using PnP.
- * 
- * This gives us the pose directly in the map coordinate system,
- * avoiding scale drift that occurs with essential matrix estimation.
- * PnP maintains consistent scale because we're localizing against
- * existing 3D points that already have proper scale.
  * 
  * @param K Camera intrinsic matrix.
  * @param points2D 2D image points (in current frame).
@@ -614,13 +591,13 @@ bool estimatePoseFromPnP(
         points3D,
         points2D,
         K,
-        cv::noArray(),  // No distortion (images already undistorted)
+        cv::noArray(), 
         rvec,
         tvec,
-        false,          // useExtrinsicGuess
-        300,            // iterationsCount
-        4.0,            // reprojectionError threshold (pixels)
-        0.99,           // confidence
+        false,          
+        300,            
+        4.0,            
+        0.99,           
         inliers,
         cv::SOLVEPNP_ITERATIVE
     );
@@ -1090,11 +1067,6 @@ void refinePointGN(
  * After pose graph optimization corrects the camera poses, the 3D points
  * triangulated with the old poses become inconsistent. This function
  * re-triangulates all points using the corrected poses.
- * 
- * For each point:
- * 1. Find all observations of this point
- * 2. Use two-view triangulation with the first two cameras
- * 3. (Optional) Refine with all views
  * 
  * @param K Camera intrinsic matrix.
  * @param poses Corrected camera poses.
@@ -1589,8 +1561,6 @@ int main(int argc, char** argv)
             // === POSE ESTIMATION ===
             // Strategy: Try PnP first (if we have existing 3D map points), 
             // fall back to essential matrix if not enough correspondences.
-            // PnP gives us absolute pose with consistent scale.
-            // Essential matrix gives relative pose with unit-norm translation (scale drift).
             
             cv::Mat inlierMask, R, t;
             bool usedPnP = false;
@@ -1640,9 +1610,6 @@ int main(int argc, char** argv)
                         inlierMask.at<uchar>(matchIdx) = 1;
                     }
                     
-                    // For matches WITHOUT existing 3D points, verify geometrically
-                    // by checking reprojection with the estimated pose
-                    // This allows us to triangulate new points from these matches
                     cv::Mat P_new(3, 4, CV_64F);
                     cv::hconcat(R, t, P_new);
                     P_new = K * P_new;
@@ -1996,12 +1963,6 @@ int main(int argc, char** argv)
                         poseEdges.push_back(edge);
                     }
                     
-                    // Add loop closure edge
-                    // IMPORTANT: Scale the loop closure translation to match odometry scale
-                    // - Loop closure gives us correct DIRECTION (from essential matrix)
-                    // - But translation has unit norm (scale ambiguity in monocular vision)
-                    // - Use odometry baseline to estimate the correct scale
-                    
                     // Compute expected relative translation from accumulated odometry
                     cv::Mat t_rel_odometry = poses[globalBestCurrFrame].t - 
                                              globalBestR * poses[globalBestPastFrame].t;
@@ -2150,121 +2111,7 @@ int main(int argc, char** argv)
             std::cout << "\nSkipping BA (loop closure applied). Reprojection error: " << err << " px" << std::endl;
         }
         
-        // --- 6. Outlier Removal ----------------------------------------------
-        // Remove points with high reprojection error or behind cameras
-        
-        // std::cout << "\n=== Outlier Removal ===" << std::endl;
-        
-        // // Compute per-point maximum reprojection error and check if behind any camera
-        // std::vector<bool> pointIsOutlier(all3DPoints.size(), false);
-        // std::vector<double> pointMaxError(all3DPoints.size(), 0.0);
-        
-        // for (const auto& obs : observations)
-        // {
-        //     const CameraPose& pose = poses[obs.camIndex];
-        //     const cv::Point3d& X = all3DPoints[obs.pointIndex];
-            
-        //     // Check if behind camera
-        //     cv::Mat Xw = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
-        //     cv::Mat Xc = pose.R * Xw + pose.t;
-        //     if (Xc.at<double>(2) <= 0) {
-        //         pointIsOutlier[obs.pointIndex] = true;
-        //         continue;
-        //     }
-            
-        //     // Compute reprojection error
-        //     double err = computeSingleReprojError(K, pose, X, obs.pixel);
-        //     pointMaxError[obs.pointIndex] = std::max(pointMaxError[obs.pointIndex], err);
-            
-        //     if (err > OUTLIER_REPROJ_THRESHOLD) {
-        //         pointIsOutlier[obs.pointIndex] = true;
-        //     }
-        // }
-        
-        // // Also mark points that are too far from the camera cluster
-        // // Compute centroid of camera centers
-        // cv::Mat centroid = cv::Mat::zeros(3, 1, CV_64F);
-        // int validCamCount = 0;
-        // for (const auto& pose : poses) {
-        //     if (!pose.R.empty()) {
-        //         cv::Mat C = -pose.R.t() * pose.t;
-        //         centroid += C;
-        //         validCamCount++;
-        //     }
-        // }
-        // if (validCamCount > 0) centroid /= validCamCount;
-        
-        // // Compute max camera distance from centroid
-        // double maxCamDist = 0;
-        // for (const auto& pose : poses) {
-        //     if (!pose.R.empty()) {
-        //         cv::Mat C = -pose.R.t() * pose.t;
-        //         maxCamDist = std::max(maxCamDist, cv::norm(C - centroid));
-        //     }
-        // }
-        
-        // // Mark points too far from centroid (> 5x the camera spread)
-        // double distanceThreshold = std::max(10.0, maxCamDist * 5.0);
-        // for (size_t i = 0; i < all3DPoints.size(); ++i)
-        // {
-        //     cv::Mat Xm = (cv::Mat_<double>(3,1) << all3DPoints[i].x, all3DPoints[i].y, all3DPoints[i].z);
-        //     double dist = cv::norm(Xm - centroid);
-        //     if (dist > distanceThreshold) {
-        //         pointIsOutlier[i] = true;
-        //     }
-        // }
-        
-        // // Count outliers
-        // int nOutliers = 0;
-        // for (bool isOut : pointIsOutlier) {
-        //     if (isOut) nOutliers++;
-        // }
-        
-        // std::cout << "  Outliers detected: " << nOutliers << " / " << all3DPoints.size() 
-        //           << " (" << std::setprecision(1) << std::fixed 
-        //           << 100.0 * nOutliers / all3DPoints.size() << "%)" << std::endl;
-        // std::cout << "  Distance threshold: " << distanceThreshold << std::endl;
-        
-        // // Create filtered point cloud and remap observations
-        // std::vector<cv::Point3d> filteredPoints;
-        // std::vector<int> oldToNewIdx(all3DPoints.size(), -1);
-        
-        // for (size_t i = 0; i < all3DPoints.size(); ++i)
-        // {
-        //     if (!pointIsOutlier[i]) {
-        //         oldToNewIdx[i] = static_cast<int>(filteredPoints.size());
-        //         filteredPoints.push_back(all3DPoints[i]);
-        //     }
-        // }
-        
-        // // Remap observations
-        // std::vector<Observation> filteredObs;
-        // for (const auto& obs : observations)
-        // {
-        //     int newIdx = oldToNewIdx[obs.pointIndex];
-        //     if (newIdx != -1) {
-        //         filteredObs.push_back({obs.camIndex, newIdx, obs.pixel});
-        //     }
-        // }
-        
-        // std::cout << "  Points after filtering: " << filteredPoints.size() << std::endl;
-        // std::cout << "  Observations after filtering: " << filteredObs.size() << std::endl;
-        
-        // // Replace with filtered data
-        // all3DPoints = std::move(filteredPoints);
-        // observations = std::move(filteredObs);
-        
-        // // Run BA again on filtered data
-        // std::cout << "\n=== Final Bundle Adjustment ===" << std::endl;
-        // double errFiltered = computeReprojectionError(K, poses, all3DPoints, observations);
-        // std::cout << "Reprojection error after filtering: " << errFiltered << " px" << std::endl;
-        
-        // runBundleAdjustment(K, poses, all3DPoints, observations, 3);
-        
-        // double errFinal = computeReprojectionError(K, poses, all3DPoints, observations);
-        // std::cout << "\nFINAL reprojection error: " << errFinal << " px" << std::endl;
-        
-        // --- 7. Save to OBJ --------------------------------------------------
+        // --- 6. Save to OBJ --------------------------------------------------
 
         // Save with timestamp
         std::string timestamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
