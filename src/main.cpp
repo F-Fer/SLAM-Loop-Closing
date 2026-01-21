@@ -32,7 +32,7 @@
 namespace fs = std::filesystem;
 
 // === CONFIGURATION ===
-std::string VIDEO_FILENAME = "IMG_0284.MOV";
+std::string VIDEO_FILENAME = "IMG_0282.MOV";
 
 // Keyframe selection thresholds
 const double MIN_MEDIAN_DISPLACEMENT = 20.0;   // Minimum median pixel displacement for keyframe
@@ -65,7 +65,7 @@ enum class PoseGraphMethod {
     SIMPLE_LINEAR,     // Simple linear interpolation of rotation error
     GAUSS_NEWTON       // Full Gauss-Newton optimization on pose graph
 };
-const PoseGraphMethod POSE_GRAPH_METHOD = PoseGraphMethod::GAUSS_NEWTON;
+const PoseGraphMethod POSE_GRAPH_METHOD = PoseGraphMethod::SIMPLE_LINEAR;
 const int POSE_GRAPH_ITERATIONS = 20;          // Number of GN iterations for pose graph optimization
 
 // Loop closure settings
@@ -479,24 +479,33 @@ void optimizePoseGraph(
 }
 
 /**
- * @brief Simple linear pose correction (original method).
- * Distributes rotation error linearly along the trajectory.
+ * @brief Simple linear pose correction.
+ * 
+ * Distributes both rotation AND translation error linearly along the trajectory.
+ * This is a common and effective approach for single loop closures.
+ * 
+ * For each frame f between pastFrame and loopFrame:
+ *   alpha = (f - pastFrame) / (loopFrame - pastFrame)
+ *   R_corrected = R_alpha_error * R_original
+ *   C_corrected = C_original - alpha * C_drift
  */
 void simplePoseCorrection(
     std::vector<CameraPose>& poses,
     int loopFrameIdx,
     int pastFrameIdx,
     const cv::Mat& R_loop,
-    const cv::Mat& /* t_loop - unused due to scale ambiguity */)
+    const cv::Mat& t_loop)
 {
     cv::Mat R_past = poses[pastFrameIdx].R;
     cv::Mat t_past = poses[pastFrameIdx].t;
     cv::Mat R_curr = poses[loopFrameIdx].R;
+    cv::Mat t_curr = poses[loopFrameIdx].t;
     
-    // Sequential relative pose
+    // === ROTATION CORRECTION ===
+    // Sequential relative rotation (from odometry)
     cv::Mat R_seq = R_curr * R_past.t();
     
-    // Rotation error
+    // Rotation error: how much the odometry rotation differs from loop closure
     cv::Mat R_err = R_loop * R_seq.t();
     cv::Mat rvec_err;
     cv::Rodrigues(R_err, rvec_err);
@@ -504,7 +513,31 @@ void simplePoseCorrection(
     double angleErr = cv::norm(rvec_err);
     std::cout << "  Rotation drift: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
     
-    // Distribute error linearly
+    // === TRANSLATION CORRECTION ===
+    // Compute camera centers in world coordinates
+    cv::Mat C_past = -R_past.t() * t_past;  // Camera center of past frame
+    cv::Mat C_curr = -R_curr.t() * t_curr;  // Camera center of current frame (from odometry)
+    
+    // For a TRUE loop closure, the camera has returned to (approximately) the same position.
+    // The translation from recoverPose() only gives DIRECTION, not magnitude.
+    // 
+    // Two options:
+    // 1. Use odometry scale (preserves trajectory shape but doesn't close the loop spatially)
+    // 2. Assume same position (closes the loop but may distort trajectory)
+    //
+    // For loop closure visualization, option 2 makes more sense - the camera returned
+    // to where it started, so Frame_curr should be at (approximately) the same position as Frame_past.
+    //
+    // We use the expected position = C_past (same position)
+    // This means we're correcting all the translation drift that accumulated.
+    cv::Mat C_curr_expected = C_past.clone();  // Loop closure: camera returned to same position
+    
+    // Translation drift: difference between where curr IS and where it SHOULD BE
+    cv::Mat C_drift = C_curr - C_curr_expected;
+    double translationErr = cv::norm(C_drift);
+    std::cout << "  Translation drift: " << translationErr << " units" << std::endl;
+    
+    // === DISTRIBUTE CORRECTIONS LINEARLY ===
     int numFramesToCorrect = loopFrameIdx - pastFrameIdx;
     std::cout << "  Correcting poses for frames " << (pastFrameIdx + 1) 
               << " to " << loopFrameIdx << std::endl;
@@ -513,16 +546,37 @@ void simplePoseCorrection(
     {
         if (poses[f].R.empty()) continue;
         
+        // Linear interpolation factor (0 at pastFrame, 1 at loopFrame)
         double alpha = (double)(f - pastFrameIdx) / numFramesToCorrect;
         
+        // IMPORTANT: Get camera center BEFORE changing R
+        // C = -R^T * t only works when R and t are consistent
+        cv::Mat R_old = poses[f].R.clone();
+        cv::Mat t_old = poses[f].t.clone();
+        cv::Mat C_f = -R_old.t() * t_old;  // Original camera center in world coords
+        
+        // Apply rotation correction
         cv::Mat rvec_correction = alpha * rvec_err;
         cv::Mat R_correction;
         cv::Rodrigues(rvec_correction, R_correction);
+        cv::Mat R_new = R_correction * R_old;
         
-        poses[f].R = R_correction * poses[f].R;
+        // Apply translation correction to camera center
+        cv::Mat C_f_corrected = C_f - alpha * C_drift;
+        
+        // Convert back to t = -R * C using the NEW rotation
+        cv::Mat t_new = -R_new * C_f_corrected;
+        
+        // Update pose
+        poses[f].R = R_new;
+        poses[f].t = t_new;
     }
     
-    std::cout << "  Simple pose correction applied." << std::endl;
+    // Report final drift
+    cv::Mat C_curr_new = -poses[loopFrameIdx].R.t() * poses[loopFrameIdx].t;
+    double finalDrift = cv::norm(C_curr_new - C_curr_expected);
+    std::cout << "  Translation drift after correction: " << finalDrift << " units" << std::endl;
+    std::cout << "  Simple pose correction applied (rotation + translation)." << std::endl;
 }
 
 /**
@@ -1035,6 +1089,139 @@ void refinePointGN(
     X.z = p[2];
 }
 
+
+/**
+ * @brief Re-triangulate all 3D points using updated camera poses.
+ * 
+ * After pose graph optimization corrects the camera poses, the 3D points
+ * triangulated with the old poses become inconsistent. This function
+ * re-triangulates all points using the corrected poses.
+ * 
+ * For each point:
+ * 1. Find all observations of this point
+ * 2. Use two-view triangulation with the first two cameras
+ * 3. (Optional) Refine with all views
+ * 
+ * @param K Camera intrinsic matrix.
+ * @param poses Corrected camera poses.
+ * @param points3D Vector of 3D points to update (modified in place).
+ * @param observations All 2D observations.
+ */
+void reTriangulatePoints(
+    const cv::Mat& K,
+    const std::vector<CameraPose>& poses,
+    std::vector<cv::Point3d>& points3D,
+    const std::vector<Observation>& observations)
+{
+    std::cout << "\n=== Re-triangulating 3D points with corrected poses ===" << std::endl;
+    
+    const int numPoints = static_cast<int>(points3D.size());
+    
+    // Group observations by point index
+    std::vector<std::vector<const Observation*>> obsPerPoint(numPoints);
+    for (const auto& obs : observations)
+    {
+        if (obs.pointIndex >= 0 && obs.pointIndex < numPoints)
+        {
+            obsPerPoint[obs.pointIndex].push_back(&obs);
+        }
+    }
+    
+    int retriangulated = 0;
+    int failed = 0;
+    
+    for (int ptIdx = 0; ptIdx < numPoints; ++ptIdx)
+    {
+        const auto& obsForPoint = obsPerPoint[ptIdx];
+        
+        if (obsForPoint.size() < 2)
+        {
+            // Need at least 2 views to triangulate
+            failed++;
+            continue;
+        }
+        
+        // Find two observations with valid poses and sufficient baseline
+        const Observation* obs1 = nullptr;
+        const Observation* obs2 = nullptr;
+        double bestBaseline = 0;
+        
+        for (size_t i = 0; i < obsForPoint.size() && obs1 == nullptr; ++i)
+        {
+            int camIdx1 = obsForPoint[i]->camIndex;
+            if (poses[camIdx1].R.empty()) continue;
+            
+            for (size_t j = i + 1; j < obsForPoint.size(); ++j)
+            {
+                int camIdx2 = obsForPoint[j]->camIndex;
+                if (poses[camIdx2].R.empty()) continue;
+                
+                // Compute baseline
+                cv::Mat C1 = -poses[camIdx1].R.t() * poses[camIdx1].t;
+                cv::Mat C2 = -poses[camIdx2].R.t() * poses[camIdx2].t;
+                double baseline = cv::norm(C2 - C1);
+                
+                if (baseline > bestBaseline)
+                {
+                    bestBaseline = baseline;
+                    obs1 = obsForPoint[i];
+                    obs2 = obsForPoint[j];
+                }
+            }
+        }
+        
+        if (obs1 == nullptr || obs2 == nullptr || bestBaseline < 1e-6)
+        {
+            failed++;
+            continue;
+        }
+        
+        // Build projection matrices
+        cv::Mat P1(3, 4, CV_64F), P2(3, 4, CV_64F);
+        cv::hconcat(poses[obs1->camIndex].R, poses[obs1->camIndex].t, P1);
+        P1 = K * P1;
+        cv::hconcat(poses[obs2->camIndex].R, poses[obs2->camIndex].t, P2);
+        P2 = K * P2;
+        
+        // Triangulate
+        std::vector<cv::Point2f> pts1 = { cv::Point2f(obs1->pixel.x, obs1->pixel.y) };
+        std::vector<cv::Point2f> pts2 = { cv::Point2f(obs2->pixel.x, obs2->pixel.y) };
+        
+        cv::Mat points4D;
+        cv::triangulatePoints(P1, P2, pts1, pts2, points4D);
+        
+        double w = points4D.at<float>(3, 0);
+        if (std::abs(w) < 1e-9)
+        {
+            failed++;
+            continue;
+        }
+        
+        cv::Point3d newPoint(
+            points4D.at<float>(0, 0) / w,
+            points4D.at<float>(1, 0) / w,
+            points4D.at<float>(2, 0) / w
+        );
+        
+        // Verify depth is positive in both cameras
+        cv::Mat Xw = (cv::Mat_<double>(3,1) << newPoint.x, newPoint.y, newPoint.z);
+        cv::Mat Xc1 = poses[obs1->camIndex].R * Xw + poses[obs1->camIndex].t;
+        cv::Mat Xc2 = poses[obs2->camIndex].R * Xw + poses[obs2->camIndex].t;
+        
+        if (Xc1.at<double>(2) <= 0 || Xc2.at<double>(2) <= 0)
+        {
+            failed++;
+            continue;
+        }
+        
+        // Update the point
+        points3D[ptIdx] = newPoint;
+        retriangulated++;
+    }
+    
+    std::cout << "  Re-triangulated: " << retriangulated << " / " << numPoints << " points" << std::endl;
+    std::cout << "  Failed: " << failed << " points" << std::endl;
+}
 
 /**
  * @brief Compute reprojection error for all observations.
@@ -2214,17 +2401,31 @@ int main(int argc, char** argv)
                     }
                     
                     // Add loop closure edge
+                    // IMPORTANT: Scale the loop closure translation to match odometry scale
+                    // - Loop closure gives us correct DIRECTION (from essential matrix)
+                    // - But translation has unit norm (scale ambiguity in monocular vision)
+                    // - Use odometry baseline to estimate the correct scale
+                    
+                    // Compute expected relative translation from accumulated odometry
+                    cv::Mat t_rel_odometry = poses[globalBestCurrFrame].t - 
+                                             globalBestR * poses[globalBestPastFrame].t;
+                    double odometry_scale = cv::norm(t_rel_odometry);
+                    
+                    // Scale the loop closure translation to match
+                    cv::Mat t_loop_scaled = globalBestT * odometry_scale;
+                    
                     PoseEdge loopEdge;
                     loopEdge.from = globalBestPastFrame;
                     loopEdge.to = globalBestCurrFrame;
                     loopEdge.R_rel = globalBestR.clone();
-                    loopEdge.t_rel = globalBestT.clone();
+                    loopEdge.t_rel = t_loop_scaled.clone();  // Use scaled translation!
                     loopEdge.weight = 10.0;  // Loop closures have higher weight (more trusted)
                     loopEdge.isLoopClosure = true;
                     poseEdges.push_back(loopEdge);
                     
                     std::cout << "  Built pose graph: " << poseEdges.size() << " edges ("
                               << (poseEdges.size() - 1) << " sequential + 1 loop closure)" << std::endl;
+                    std::cout << "  Loop closure translation scale: " << odometry_scale << std::endl;
                     
                     // Compute rotation drift before optimization
                     cv::Mat R_seq = poses[globalBestCurrFrame].R * poses[globalBestPastFrame].R.t();
@@ -2233,6 +2434,17 @@ int main(int argc, char** argv)
                     cv::Rodrigues(R_err, rvec_err);
                     double angleErr = cv::norm(rvec_err);
                     std::cout << "  Rotation drift before PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+                    
+                    // Compute translation drift before optimization
+                    // Compare camera centers: where odometry says curr is vs where loop closure says it should be
+                    cv::Mat C_past = -poses[globalBestPastFrame].R.t() * poses[globalBestPastFrame].t;
+                    cv::Mat C_curr_odometry = -poses[globalBestCurrFrame].R.t() * poses[globalBestCurrFrame].t;
+                    // Expected position based on loop closure
+                    // C_curr_expected = C_past - R_past^T * R_loop^T * t_loop (correct world frame transform)
+                    cv::Mat R_past = poses[globalBestPastFrame].R;
+                    cv::Mat C_curr_expected = C_past - R_past.t() * globalBestR.t() * t_loop_scaled;
+                    double translationDrift = cv::norm(C_curr_odometry - C_curr_expected);
+                    std::cout << "  Translation drift before PGO: " << translationDrift << " units" << std::endl;
                     
                     // Run pose graph optimization
                     optimizePoseGraph(poses, poseEdges, POSE_GRAPH_ITERATIONS);
@@ -2243,6 +2455,15 @@ int main(int argc, char** argv)
                     cv::Rodrigues(R_err, rvec_err);
                     angleErr = cv::norm(rvec_err);
                     std::cout << "  Rotation drift after PGO: " << angleErr * 180.0 / CV_PI << " degrees" << std::endl;
+                    
+                    // Compute translation drift after optimization
+                    C_past = -poses[globalBestPastFrame].R.t() * poses[globalBestPastFrame].t;
+                    C_curr_odometry = -poses[globalBestCurrFrame].R.t() * poses[globalBestCurrFrame].t;
+                    // Recompute expected position with updated past pose
+                    R_past = poses[globalBestPastFrame].R;
+                    C_curr_expected = C_past - R_past.t() * globalBestR.t() * t_loop_scaled;
+                    translationDrift = cv::norm(C_curr_odometry - C_curr_expected);
+                    std::cout << "  Translation drift after PGO: " << translationDrift << " units" << std::endl;
                 }
                 
                 // === ADD LOOP CLOSURE OBSERVATIONS ===
@@ -2277,6 +2498,19 @@ int main(int argc, char** argv)
             std::cout << "\n=== Loop Closure Detection DISABLED ===" << std::endl;
         }
 
+        // --- 3b. Re-triangulate points after PGO -----------------------------
+        // If loop closure was applied, the poses have been corrected but the
+        // 3D points are still in their old positions. We need to re-triangulate
+        // them using the corrected poses, otherwise BA will undo the correction.
+        
+        if (ENABLE_LOOP_CLOSURE && globalBestCurrFrame != -1)
+        {
+            reTriangulatePoints(K, poses, all3DPoints, observations);
+            
+            // Report reprojection error after re-triangulation
+            double errAfterRetri = computeReprojectionError(K, poses, all3DPoints, observations);
+            std::cout << "  Reprojection error after re-triangulation: " << errAfterRetri << " px" << std::endl;
+        }
 
         // --- 4. Report results ----------------------------------------------
 
