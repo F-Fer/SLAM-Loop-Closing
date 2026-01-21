@@ -51,14 +51,8 @@ const double MAX_DEPTH = 50.0;                 // Maximum depth (relative to bas
 const double OUTLIER_REPROJ_THRESHOLD = 5.0;   // Remove points with reproj error > this after BA
 
 // Bundle adjustment settings
-enum class BAMethod {
-    ALTERNATING,       // Alternating optimization (cameras then points) - fast but suboptimal
-    JOINT              // Joint optimization of all parameters - slower but better convergence
-};
-const BAMethod BA_METHOD = BAMethod::JOINT;
 const bool USE_HUBER_LOSS = true;              // Use Huber robust loss to handle outliers
 const double HUBER_DELTA = 2.0;                // Huber threshold in pixels
-const int BA_MAX_ITERATIONS = 30;              // Maximum BA iterations
 
 // Pose graph optimization
 enum class PoseGraphMethod {
@@ -1261,383 +1255,6 @@ double computeReprojectionError(
 }
 
 /**
- * @brief Joint Bundle Adjustment with Levenberg-Marquardt and optional Huber loss.
- * 
- * Jointly optimizes all camera poses and 3D points to minimize reprojection error.
- * Camera 0 is held fixed as the reference frame.
- * 
- * Parameter layout:
- *   [cam1_rx, cam1_ry, cam1_rz, cam1_tx, cam1_ty, cam1_tz,
- *    cam2_rx, ..., camN_rx, ...,
- *    pt0_x, pt0_y, pt0_z, pt1_x, ...]
- * 
- * Uses numeric Jacobian for simplicity. For production code, use Ceres or g2o.
- * 
- * @param K Camera intrinsic matrix.
- * @param poses Vector of camera poses (will be updated, pose 0 is fixed).
- * @param points3D Vector of 3D points (will be updated).
- * @param observations List of 2D observations.
- * @param useHuber Whether to use Huber robust loss.
- * @param huberDelta Huber threshold in pixels.
- * @param maxIterations Maximum LM iterations.
- * @return true if optimization ran, false if problem was too large (caller should fall back)
- */
-bool jointBundleAdjustment(
-    const cv::Mat& K,
-    std::vector<CameraPose>& poses,
-    std::vector<cv::Point3d>& points3D,
-    const std::vector<Observation>& observations,
-    bool useHuber = true,
-    double huberDelta = 2.0,
-    int maxIterations = 30)
-{
-    if (poses.empty() || points3D.empty() || observations.empty())
-    {
-        std::cerr << "Nothing to optimize in BA." << std::endl;
-        return true;  // Nothing to do, but not a fallback case
-    }
-
-    const int numCams = static_cast<int>(poses.size());
-    const int numPts = static_cast<int>(points3D.size());
-    const int numObs = static_cast<int>(observations.size());
-    
-    // Parameter counts (camera 0 is fixed)
-    const int camParamCount = (numCams - 1) * 6;
-    const int ptParamCount = numPts * 3;
-    const int totalParams = camParamCount + ptParamCount;
-    const int totalResiduals = numObs * 2;  // 2 residuals (u, v) per observation
-    
-    // Check problem size - dense BA requires storing full Jacobian matrix
-    // Memory needed: totalResiduals * totalParams * 8 bytes
-    // For safety, limit to problems where Jacobian < ~1GB
-    const long long jacobianSize = static_cast<long long>(totalResiduals) * totalParams;
-    const long long MAX_JACOBIAN_ELEMENTS = 100000000LL;  // ~800MB for doubles
-    
-    if (jacobianSize > MAX_JACOBIAN_ELEMENTS)
-    {
-        std::cout << "\nProblem too large for dense joint BA:" << std::endl;
-        std::cout << "  Jacobian would be " << totalResiduals << " x " << totalParams 
-                  << " = " << (jacobianSize * 8 / 1e9) << " GB" << std::endl;
-        std::cout << "  Falling back to alternating BA..." << std::endl;
-        return false;  // Signal caller to use alternating BA
-    }
-    
-    std::cout << "\nStarting joint bundle adjustment:" << std::endl;
-    std::cout << "  Cameras: " << numCams << " (" << camParamCount << " params, cam 0 fixed)" << std::endl;
-    std::cout << "  Points: " << numPts << " (" << ptParamCount << " params)" << std::endl;
-    std::cout << "  Observations: " << numObs << " (" << totalResiduals << " residuals)" << std::endl;
-    std::cout << "  Huber loss: " << (useHuber ? "enabled" : "disabled");
-    if (useHuber) std::cout << " (delta=" << huberDelta << " px)";
-    std::cout << std::endl;
-    
-    // === Convert current state to parameter vector ===
-    std::vector<double> params(totalParams);
-    
-    // Pack camera parameters (skip camera 0)
-    for (int c = 1; c < numCams; ++c)
-    {
-        if (poses[c].R.empty()) {
-            // Initialize invalid poses to identity
-            for (int j = 0; j < 6; ++j) 
-                params[(c-1)*6 + j] = 0.0;
-            continue;
-        }
-        cv::Mat rvec;
-        cv::Rodrigues(poses[c].R, rvec);
-        params[(c-1)*6 + 0] = rvec.at<double>(0);
-        params[(c-1)*6 + 1] = rvec.at<double>(1);
-        params[(c-1)*6 + 2] = rvec.at<double>(2);
-        params[(c-1)*6 + 3] = poses[c].t.at<double>(0);
-        params[(c-1)*6 + 4] = poses[c].t.at<double>(1);
-        params[(c-1)*6 + 5] = poses[c].t.at<double>(2);
-    }
-    
-    // Pack point parameters
-    for (int p = 0; p < numPts; ++p)
-    {
-        params[camParamCount + p*3 + 0] = points3D[p].x;
-        params[camParamCount + p*3 + 1] = points3D[p].y;
-        params[camParamCount + p*3 + 2] = points3D[p].z;
-    }
-    
-    // === Helper to unpack parameters ===
-    auto unpackParams = [&](const std::vector<double>& p) {
-        // Unpack cameras
-        for (int c = 1; c < numCams; ++c)
-        {
-            cv::Mat rvec = (cv::Mat_<double>(3,1) << 
-                p[(c-1)*6 + 0], p[(c-1)*6 + 1], p[(c-1)*6 + 2]);
-            cv::Rodrigues(rvec, poses[c].R);
-            poses[c].t = (cv::Mat_<double>(3,1) << 
-                p[(c-1)*6 + 3], p[(c-1)*6 + 4], p[(c-1)*6 + 5]);
-        }
-        // Unpack points
-        for (int pt = 0; pt < numPts; ++pt)
-        {
-            points3D[pt].x = p[camParamCount + pt*3 + 0];
-            points3D[pt].y = p[camParamCount + pt*3 + 1];
-            points3D[pt].z = p[camParamCount + pt*3 + 2];
-        }
-    };
-    
-    // === Helper to compute residuals and optionally Jacobian ===
-    auto computeResidualsAndJacobian = [&](
-        const std::vector<double>& p, 
-        cv::Mat& residuals,
-        cv::Mat* J,  // nullptr if Jacobian not needed
-        std::vector<double>* weights  // Huber weights, nullptr if not needed
-    ) {
-        // Temporarily unpack parameters to compute projections
-        // (We need poses and points in their native form for projectPoint)
-        std::vector<CameraPose> tempPoses = poses;
-        std::vector<cv::Point3d> tempPoints = points3D;
-        
-        // Unpack cameras
-        for (int c = 1; c < numCams; ++c)
-        {
-            cv::Mat rvec = (cv::Mat_<double>(3,1) << 
-                p[(c-1)*6 + 0], p[(c-1)*6 + 1], p[(c-1)*6 + 2]);
-            cv::Rodrigues(rvec, tempPoses[c].R);
-            tempPoses[c].t = (cv::Mat_<double>(3,1) << 
-                p[(c-1)*6 + 3], p[(c-1)*6 + 4], p[(c-1)*6 + 5]);
-        }
-        // Unpack points
-        for (int pt = 0; pt < numPts; ++pt)
-        {
-            tempPoints[pt].x = p[camParamCount + pt*3 + 0];
-            tempPoints[pt].y = p[camParamCount + pt*3 + 1];
-            tempPoints[pt].z = p[camParamCount + pt*3 + 2];
-        }
-        
-        residuals = cv::Mat(totalResiduals, 1, CV_64F);
-        if (weights) weights->resize(numObs);
-        
-        for (int i = 0; i < numObs; ++i)
-        {
-            const Observation& obs = observations[i];
-            const CameraPose& pose = tempPoses[obs.camIndex];
-            const cv::Point3d& X = tempPoints[obs.pointIndex];
-            
-            cv::Point2d proj = projectPoint(K, pose, X);
-            
-            double rx = proj.x - obs.pixel.x;
-            double ry = proj.y - obs.pixel.y;
-            
-            residuals.at<double>(2*i + 0) = rx;
-            residuals.at<double>(2*i + 1) = ry;
-            
-            if (weights)
-            {
-                double err = std::sqrt(rx*rx + ry*ry);
-                (*weights)[i] = useHuber ? huberWeight(err, huberDelta) : 1.0;
-            }
-        }
-        
-        // Compute Jacobian numerically if requested
-        if (J)
-        {
-            const double eps = 1e-6;
-            *J = cv::Mat(totalResiduals, totalParams, CV_64F, cv::Scalar(0));
-            
-            // For each observation, only compute derivatives w.r.t. relevant parameters
-            // (the camera that sees it and the point being observed)
-            for (int i = 0; i < numObs; ++i)
-            {
-                const Observation& obs = observations[i];
-                int camIdx = obs.camIndex;
-                int ptIdx = obs.pointIndex;
-                
-                // Camera parameters (skip if camera 0)
-                if (camIdx > 0)
-                {
-                    int camParamStart = (camIdx - 1) * 6;
-                    
-                    for (int k = 0; k < 6; ++k)
-                    {
-                        std::vector<double> p_plus = p;
-                        std::vector<double> p_minus = p;
-                        p_plus[camParamStart + k] += eps;
-                        p_minus[camParamStart + k] -= eps;
-                        
-                        // Recompute projection for perturbed camera
-                        cv::Mat rvec_p = (cv::Mat_<double>(3,1) << 
-                            p_plus[(camIdx-1)*6 + 0], p_plus[(camIdx-1)*6 + 1], p_plus[(camIdx-1)*6 + 2]);
-                        cv::Mat R_p;
-                        cv::Rodrigues(rvec_p, R_p);
-                        cv::Mat t_p = (cv::Mat_<double>(3,1) << 
-                            p_plus[(camIdx-1)*6 + 3], p_plus[(camIdx-1)*6 + 4], p_plus[(camIdx-1)*6 + 5]);
-                        CameraPose pose_p; pose_p.R = R_p; pose_p.t = t_p;
-                        cv::Point2d proj_p = projectPoint(K, pose_p, tempPoints[ptIdx]);
-                        
-                        cv::Mat rvec_m = (cv::Mat_<double>(3,1) << 
-                            p_minus[(camIdx-1)*6 + 0], p_minus[(camIdx-1)*6 + 1], p_minus[(camIdx-1)*6 + 2]);
-                        cv::Mat R_m;
-                        cv::Rodrigues(rvec_m, R_m);
-                        cv::Mat t_m = (cv::Mat_<double>(3,1) << 
-                            p_minus[(camIdx-1)*6 + 3], p_minus[(camIdx-1)*6 + 4], p_minus[(camIdx-1)*6 + 5]);
-                        CameraPose pose_m; pose_m.R = R_m; pose_m.t = t_m;
-                        cv::Point2d proj_m = projectPoint(K, pose_m, tempPoints[ptIdx]);
-                        
-                        J->at<double>(2*i + 0, camParamStart + k) = (proj_p.x - proj_m.x) / (2 * eps);
-                        J->at<double>(2*i + 1, camParamStart + k) = (proj_p.y - proj_m.y) / (2 * eps);
-                    }
-                }
-                
-                // Point parameters
-                int ptParamStart = camParamCount + ptIdx * 3;
-                
-                for (int k = 0; k < 3; ++k)
-                {
-                    cv::Point3d X_p = tempPoints[ptIdx];
-                    cv::Point3d X_m = tempPoints[ptIdx];
-                    
-                    if (k == 0) { X_p.x += eps; X_m.x -= eps; }
-                    else if (k == 1) { X_p.y += eps; X_m.y -= eps; }
-                    else { X_p.z += eps; X_m.z -= eps; }
-                    
-                    cv::Point2d proj_p = projectPoint(K, tempPoses[camIdx], X_p);
-                    cv::Point2d proj_m = projectPoint(K, tempPoses[camIdx], X_m);
-                    
-                    J->at<double>(2*i + 0, ptParamStart + k) = (proj_p.x - proj_m.x) / (2 * eps);
-                    J->at<double>(2*i + 1, ptParamStart + k) = (proj_p.y - proj_m.y) / (2 * eps);
-                }
-            }
-        }
-    };
-    
-    // === Levenberg-Marquardt optimization ===
-    double lambda = 1e-3;  // LM damping parameter
-    const double lambdaUp = 10.0;
-    const double lambdaDown = 0.1;
-    
-    cv::Mat residuals;
-    std::vector<double> weights;
-    computeResidualsAndJacobian(params, residuals, nullptr, &weights);
-    
-    double prevCost = 0;
-    for (int i = 0; i < numObs; ++i)
-    {
-        double rx = residuals.at<double>(2*i);
-        double ry = residuals.at<double>(2*i + 1);
-        double w = weights[i];
-        prevCost += w * (rx*rx + ry*ry);
-    }
-    
-    for (int iter = 0; iter < maxIterations; ++iter)
-    {
-        // Compute Jacobian
-        cv::Mat J;
-        computeResidualsAndJacobian(params, residuals, &J, &weights);
-        
-        // Apply Huber weights to Jacobian and residuals
-        if (useHuber)
-        {
-            for (int i = 0; i < numObs; ++i)
-            {
-                double w = std::sqrt(weights[i]);
-                J.row(2*i) *= w;
-                J.row(2*i + 1) *= w;
-                residuals.at<double>(2*i) *= w;
-                residuals.at<double>(2*i + 1) *= w;
-            }
-        }
-        
-        // Normal equations: H * dp = -g where H = J^T * J, g = J^T * r
-        cv::Mat H = J.t() * J;
-        cv::Mat g = J.t() * residuals;
-        
-        // Apply LM damping
-        for (int k = 0; k < totalParams; ++k)
-        {
-            H.at<double>(k, k) *= (1.0 + lambda);
-        }
-        
-        // Solve for update
-        cv::Mat dp;
-        bool solved = cv::solve(H, -g, dp, cv::DECOMP_CHOLESKY);
-        
-        if (!solved)
-        {
-            // Try with more regularization
-            lambda *= lambdaUp;
-            if (lambda > 1e10) {
-                std::cout << "  LM failed to converge (solve failed)" << std::endl;
-                break;
-            }
-            continue;
-        }
-        
-        // Trial update
-        std::vector<double> paramsNew(totalParams);
-        for (int k = 0; k < totalParams; ++k)
-        {
-            paramsNew[k] = params[k] + dp.at<double>(k);
-        }
-        
-        // Compute new cost
-        cv::Mat residualsNew;
-        std::vector<double> weightsNew;
-        computeResidualsAndJacobian(paramsNew, residualsNew, nullptr, &weightsNew);
-        
-        double newCost = 0;
-        for (int i = 0; i < numObs; ++i)
-        {
-            double rx = residualsNew.at<double>(2*i);
-            double ry = residualsNew.at<double>(2*i + 1);
-            double w = weightsNew[i];
-            newCost += w * (rx*rx + ry*ry);
-        }
-        
-        if (newCost < prevCost)
-        {
-            // Accept update
-            params = paramsNew;
-            lambda *= lambdaDown;
-            lambda = std::max(lambda, 1e-10);
-            
-            double improvement = (prevCost - newCost) / prevCost;
-            prevCost = newCost;
-            
-            // Compute current reprojection error
-            unpackParams(params);
-            double meanErr = computeReprojectionError(K, poses, points3D, observations);
-            
-            if (iter % 5 == 0 || iter == maxIterations - 1)
-            {
-                std::cout << "  Iter " << std::setw(2) << iter 
-                          << ": cost=" << std::scientific << std::setprecision(3) << newCost
-                          << ", err=" << std::fixed << std::setprecision(2) << meanErr << " px"
-                          << ", lambda=" << std::scientific << std::setprecision(1) << lambda
-                          << std::endl;
-            }
-            
-            // Check convergence
-            if (improvement < 1e-6)
-            {
-                std::cout << "  Converged at iteration " << iter << " (cost improvement < 1e-6)" << std::endl;
-                break;
-            }
-        }
-        else
-        {
-            // Reject update, increase damping
-            lambda *= lambdaUp;
-            if (lambda > 1e10) {
-                std::cout << "  LM converged at iteration " << iter << " (lambda overflow)" << std::endl;
-                break;
-            }
-        }
-    }
-    
-    // Final unpack
-    unpackParams(params);
-    
-    double finalErr = computeReprojectionError(K, poses, points3D, observations);
-    std::cout << "Joint bundle adjustment finished. Final error: " << finalErr << " px" << std::endl;
-    return true;
-}
-
-/**
  * @brief Alternating bundle adjustment:
  *        - refine all camera poses with fixed 3D points
  *        - refine all 3D points with fixed camera poses
@@ -1690,9 +1307,9 @@ void alternatingBundleAdjustment(
 }
 
 /**
- * @brief Run bundle adjustment using the configured method.
+ * @brief Run bundle adjustment.
  * 
- * Dispatches to either joint or alternating BA based on BA_METHOD setting.
+ * Uses alternating optimization with optional Huber loss.
  */
 void runBundleAdjustment(
     const cv::Mat& K,
@@ -1701,23 +1318,8 @@ void runBundleAdjustment(
     const std::vector<Observation>& observations,
     int numIterations = 5)
 {
-    if (BA_METHOD == BAMethod::JOINT)
-    {
-        // Try joint BA, fall back to alternating if problem is too large
-        bool success = jointBundleAdjustment(K, poses, points3D, observations, 
-                                             USE_HUBER_LOSS, HUBER_DELTA, BA_MAX_ITERATIONS);
-        if (!success)
-        {
-            // Problem too large for dense joint BA, use alternating instead with Huber
-            alternatingBundleAdjustment(K, poses, points3D, observations, numIterations,
-                                        USE_HUBER_LOSS, HUBER_DELTA);
-        }
-    }
-    else
-    {
-        alternatingBundleAdjustment(K, poses, points3D, observations, numIterations,
-                                    USE_HUBER_LOSS, HUBER_DELTA);
-    }
+    alternatingBundleAdjustment(K, poses, points3D, observations, numIterations,
+                                USE_HUBER_LOSS, HUBER_DELTA);
 }
 
 /**
@@ -1876,12 +1478,6 @@ int main(int argc, char** argv)
         std::cout << "Found " << allFramePaths.size() << " total frames in sequence." << std::endl;
 
         // --- 1. Camera intrinsics (K) ----------------------------------------
-        //
-        // TODO: Replace with your actual calibration matrix. Values below are
-        // a typical example (fx, fy, cx, cy) for a ~640x480 camera.
-        //
-        // K must be double-precision for the code below.
-        // Camera intrinsics + distortion from chessboard calibration
         const double fx = 1226.991674550505;
         const double fy = 1231.583548480416;
         const double cx = 529.5391035340654;
@@ -2532,128 +2128,141 @@ int main(int argc, char** argv)
         }
 
         // --- 5. Refine using interleaved bundle adjustment --------------------
-
-        double errBefore = computeReprojectionError(K, poses, all3DPoints, observations);
-        std::cout << "\nReprojection error BEFORE BA: " << errBefore << " px" << std::endl;
+        // NOTE: We skip BA after loop closure because BA only minimizes reprojection error
+        // and has no knowledge of loop closure constraints. Running BA after PGO
+        // undoes the loop closure correction as it tries to reduce reprojection error.
         
-        runBundleAdjustment(K, poses, all3DPoints, observations, 5);
+        bool loopClosureApplied = (ENABLE_LOOP_CLOSURE && globalBestCurrFrame != -1);
+        
+        if (!loopClosureApplied)
+        {
+            double errBefore = computeReprojectionError(K, poses, all3DPoints, observations);
+            std::cout << "\nReprojection error BEFORE BA: " << errBefore << " px" << std::endl;
+            
+            runBundleAdjustment(K, poses, all3DPoints, observations, 5);
 
-        double errAfter = computeReprojectionError(K, poses, all3DPoints, observations);
-        std::cout << "\nReprojection error AFTER BA: " << errAfter << " px" << std::endl;
+            double errAfter = computeReprojectionError(K, poses, all3DPoints, observations);
+            std::cout << "\nReprojection error AFTER BA: " << errAfter << " px" << std::endl;
+        }
+        else
+        {
+            double err = computeReprojectionError(K, poses, all3DPoints, observations);
+            std::cout << "\nSkipping BA (loop closure applied). Reprojection error: " << err << " px" << std::endl;
+        }
         
         // --- 6. Outlier Removal ----------------------------------------------
         // Remove points with high reprojection error or behind cameras
         
-        std::cout << "\n=== Outlier Removal ===" << std::endl;
+        // std::cout << "\n=== Outlier Removal ===" << std::endl;
         
-        // Compute per-point maximum reprojection error and check if behind any camera
-        std::vector<bool> pointIsOutlier(all3DPoints.size(), false);
-        std::vector<double> pointMaxError(all3DPoints.size(), 0.0);
+        // // Compute per-point maximum reprojection error and check if behind any camera
+        // std::vector<bool> pointIsOutlier(all3DPoints.size(), false);
+        // std::vector<double> pointMaxError(all3DPoints.size(), 0.0);
         
-        for (const auto& obs : observations)
-        {
-            const CameraPose& pose = poses[obs.camIndex];
-            const cv::Point3d& X = all3DPoints[obs.pointIndex];
+        // for (const auto& obs : observations)
+        // {
+        //     const CameraPose& pose = poses[obs.camIndex];
+        //     const cv::Point3d& X = all3DPoints[obs.pointIndex];
             
-            // Check if behind camera
-            cv::Mat Xw = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
-            cv::Mat Xc = pose.R * Xw + pose.t;
-            if (Xc.at<double>(2) <= 0) {
-                pointIsOutlier[obs.pointIndex] = true;
-                continue;
-            }
+        //     // Check if behind camera
+        //     cv::Mat Xw = (cv::Mat_<double>(3,1) << X.x, X.y, X.z);
+        //     cv::Mat Xc = pose.R * Xw + pose.t;
+        //     if (Xc.at<double>(2) <= 0) {
+        //         pointIsOutlier[obs.pointIndex] = true;
+        //         continue;
+        //     }
             
-            // Compute reprojection error
-            double err = computeSingleReprojError(K, pose, X, obs.pixel);
-            pointMaxError[obs.pointIndex] = std::max(pointMaxError[obs.pointIndex], err);
+        //     // Compute reprojection error
+        //     double err = computeSingleReprojError(K, pose, X, obs.pixel);
+        //     pointMaxError[obs.pointIndex] = std::max(pointMaxError[obs.pointIndex], err);
             
-            if (err > OUTLIER_REPROJ_THRESHOLD) {
-                pointIsOutlier[obs.pointIndex] = true;
-            }
-        }
+        //     if (err > OUTLIER_REPROJ_THRESHOLD) {
+        //         pointIsOutlier[obs.pointIndex] = true;
+        //     }
+        // }
         
-        // Also mark points that are too far from the camera cluster
-        // Compute centroid of camera centers
-        cv::Mat centroid = cv::Mat::zeros(3, 1, CV_64F);
-        int validCamCount = 0;
-        for (const auto& pose : poses) {
-            if (!pose.R.empty()) {
-                cv::Mat C = -pose.R.t() * pose.t;
-                centroid += C;
-                validCamCount++;
-            }
-        }
-        if (validCamCount > 0) centroid /= validCamCount;
+        // // Also mark points that are too far from the camera cluster
+        // // Compute centroid of camera centers
+        // cv::Mat centroid = cv::Mat::zeros(3, 1, CV_64F);
+        // int validCamCount = 0;
+        // for (const auto& pose : poses) {
+        //     if (!pose.R.empty()) {
+        //         cv::Mat C = -pose.R.t() * pose.t;
+        //         centroid += C;
+        //         validCamCount++;
+        //     }
+        // }
+        // if (validCamCount > 0) centroid /= validCamCount;
         
-        // Compute max camera distance from centroid
-        double maxCamDist = 0;
-        for (const auto& pose : poses) {
-            if (!pose.R.empty()) {
-                cv::Mat C = -pose.R.t() * pose.t;
-                maxCamDist = std::max(maxCamDist, cv::norm(C - centroid));
-            }
-        }
+        // // Compute max camera distance from centroid
+        // double maxCamDist = 0;
+        // for (const auto& pose : poses) {
+        //     if (!pose.R.empty()) {
+        //         cv::Mat C = -pose.R.t() * pose.t;
+        //         maxCamDist = std::max(maxCamDist, cv::norm(C - centroid));
+        //     }
+        // }
         
-        // Mark points too far from centroid (> 5x the camera spread)
-        double distanceThreshold = std::max(10.0, maxCamDist * 5.0);
-        for (size_t i = 0; i < all3DPoints.size(); ++i)
-        {
-            cv::Mat Xm = (cv::Mat_<double>(3,1) << all3DPoints[i].x, all3DPoints[i].y, all3DPoints[i].z);
-            double dist = cv::norm(Xm - centroid);
-            if (dist > distanceThreshold) {
-                pointIsOutlier[i] = true;
-            }
-        }
+        // // Mark points too far from centroid (> 5x the camera spread)
+        // double distanceThreshold = std::max(10.0, maxCamDist * 5.0);
+        // for (size_t i = 0; i < all3DPoints.size(); ++i)
+        // {
+        //     cv::Mat Xm = (cv::Mat_<double>(3,1) << all3DPoints[i].x, all3DPoints[i].y, all3DPoints[i].z);
+        //     double dist = cv::norm(Xm - centroid);
+        //     if (dist > distanceThreshold) {
+        //         pointIsOutlier[i] = true;
+        //     }
+        // }
         
-        // Count outliers
-        int nOutliers = 0;
-        for (bool isOut : pointIsOutlier) {
-            if (isOut) nOutliers++;
-        }
+        // // Count outliers
+        // int nOutliers = 0;
+        // for (bool isOut : pointIsOutlier) {
+        //     if (isOut) nOutliers++;
+        // }
         
-        std::cout << "  Outliers detected: " << nOutliers << " / " << all3DPoints.size() 
-                  << " (" << std::setprecision(1) << std::fixed 
-                  << 100.0 * nOutliers / all3DPoints.size() << "%)" << std::endl;
-        std::cout << "  Distance threshold: " << distanceThreshold << std::endl;
+        // std::cout << "  Outliers detected: " << nOutliers << " / " << all3DPoints.size() 
+        //           << " (" << std::setprecision(1) << std::fixed 
+        //           << 100.0 * nOutliers / all3DPoints.size() << "%)" << std::endl;
+        // std::cout << "  Distance threshold: " << distanceThreshold << std::endl;
         
-        // Create filtered point cloud and remap observations
-        std::vector<cv::Point3d> filteredPoints;
-        std::vector<int> oldToNewIdx(all3DPoints.size(), -1);
+        // // Create filtered point cloud and remap observations
+        // std::vector<cv::Point3d> filteredPoints;
+        // std::vector<int> oldToNewIdx(all3DPoints.size(), -1);
         
-        for (size_t i = 0; i < all3DPoints.size(); ++i)
-        {
-            if (!pointIsOutlier[i]) {
-                oldToNewIdx[i] = static_cast<int>(filteredPoints.size());
-                filteredPoints.push_back(all3DPoints[i]);
-            }
-        }
+        // for (size_t i = 0; i < all3DPoints.size(); ++i)
+        // {
+        //     if (!pointIsOutlier[i]) {
+        //         oldToNewIdx[i] = static_cast<int>(filteredPoints.size());
+        //         filteredPoints.push_back(all3DPoints[i]);
+        //     }
+        // }
         
-        // Remap observations
-        std::vector<Observation> filteredObs;
-        for (const auto& obs : observations)
-        {
-            int newIdx = oldToNewIdx[obs.pointIndex];
-            if (newIdx != -1) {
-                filteredObs.push_back({obs.camIndex, newIdx, obs.pixel});
-            }
-        }
+        // // Remap observations
+        // std::vector<Observation> filteredObs;
+        // for (const auto& obs : observations)
+        // {
+        //     int newIdx = oldToNewIdx[obs.pointIndex];
+        //     if (newIdx != -1) {
+        //         filteredObs.push_back({obs.camIndex, newIdx, obs.pixel});
+        //     }
+        // }
         
-        std::cout << "  Points after filtering: " << filteredPoints.size() << std::endl;
-        std::cout << "  Observations after filtering: " << filteredObs.size() << std::endl;
+        // std::cout << "  Points after filtering: " << filteredPoints.size() << std::endl;
+        // std::cout << "  Observations after filtering: " << filteredObs.size() << std::endl;
         
-        // Replace with filtered data
-        all3DPoints = std::move(filteredPoints);
-        observations = std::move(filteredObs);
+        // // Replace with filtered data
+        // all3DPoints = std::move(filteredPoints);
+        // observations = std::move(filteredObs);
         
-        // Run BA again on filtered data
-        std::cout << "\n=== Final Bundle Adjustment ===" << std::endl;
-        double errFiltered = computeReprojectionError(K, poses, all3DPoints, observations);
-        std::cout << "Reprojection error after filtering: " << errFiltered << " px" << std::endl;
+        // // Run BA again on filtered data
+        // std::cout << "\n=== Final Bundle Adjustment ===" << std::endl;
+        // double errFiltered = computeReprojectionError(K, poses, all3DPoints, observations);
+        // std::cout << "Reprojection error after filtering: " << errFiltered << " px" << std::endl;
         
-        runBundleAdjustment(K, poses, all3DPoints, observations, 3);
+        // runBundleAdjustment(K, poses, all3DPoints, observations, 3);
         
-        double errFinal = computeReprojectionError(K, poses, all3DPoints, observations);
-        std::cout << "\nFINAL reprojection error: " << errFinal << " px" << std::endl;
+        // double errFinal = computeReprojectionError(K, poses, all3DPoints, observations);
+        // std::cout << "\nFINAL reprojection error: " << errFinal << " px" << std::endl;
         
         // --- 7. Save to OBJ --------------------------------------------------
 
