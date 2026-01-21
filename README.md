@@ -62,6 +62,22 @@ Tested on video `IMG_0282.MOV` (camera returns to starting position):
 | Reprojection Error | 2.8 px | 3.2 px | 3.1 px |
 | Loop Cameras Overlap | ❌ No | ✅ Yes | ✅ Yes |
 
+### Visual Comparison
+
+**Without Loop Closure** - The trajectory does not close; start and end cameras are far apart:
+
+![No Loop Closing](data/imgs/screenshot_no_loop_closing.png)
+
+**With Linear Interpolation** - Loop closure cameras (green) overlap correctly:
+
+![Linear Interpolation](data/imgs/screenshot_linear_interpolation.png)
+
+**With Gauss-Newton PGO** - Similar result with iterative optimization:
+
+![Gauss-Newton](data/imgs/screenshot_gauss_newton.png)
+
+> **Legend:** White = 3D scene points, Blue = camera positions, Green = loop closure cameras
+
 ### Comparison: Pose Graph Optimization Methods
 
 | Aspect | Linear Interpolation | Gauss-Newton |
@@ -241,4 +257,4 @@ Our implementation is simpler but demonstrates all essential concepts of loop cl
 
 - [Monocular SLAM in Python (LearnOpenCV)](https://learnopencv.com/monocular-slam-in-python/)
 - [ORB-SLAM Paper](https://arxiv.org/abs/1502.00956)
-- OpenCV Documentation: `findEssentialMat`, `recoverPose`, `solvePnPRansac
+- OpenCV Documentation: `findEssentialMat`, `recoverPose`, `solvePnPRansac`, `triangulatePoints`
