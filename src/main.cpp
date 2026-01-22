@@ -54,11 +54,11 @@ enum class PoseGraphMethod {
     SIMPLE_LINEAR,     // Simple linear interpolation of rotation error
     GAUSS_NEWTON       // Full Gauss-Newton optimization on pose graph
 };
-const PoseGraphMethod POSE_GRAPH_METHOD = PoseGraphMethod::GAUSS_NEWTON;
+const PoseGraphMethod POSE_GRAPH_METHOD = PoseGraphMethod::SIMPLE_LINEAR;
 const int POSE_GRAPH_ITERATIONS = 20;          // Number of GN iterations for pose graph optimization
 
 // Loop closure settings
-const bool ENABLE_LOOP_CLOSURE = false;         // Set to false to disable loop closure detection
+const bool ENABLE_LOOP_CLOSURE = true;         // Set to false to disable loop closure detection
 
 // Output settings
 const bool SAVE_SCENE_POINTS = true;           // Set to false to only save camera trajectory (no 3D points)

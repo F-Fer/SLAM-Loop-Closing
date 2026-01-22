@@ -57,8 +57,8 @@ Tested on video `IMG_0282.MOV` (camera returns to starting position):
 
 | Metric | Without Loop Closure | With Loop Closure (Linear) | With Loop Closure (Gauss-Newton) |
 |--------|----------------------|----------------------------|----------------------------------|
-| Rotation Drift | ~15-20° | ~0° | ~0° |
-| Translation Drift | ~2.5 units | ~0 units | ~0 units |
+| Rotation Drift | ~15-20° | ~0° | ~2° |
+| Translation Drift | ~4.0-8.0 units | ~0 units | ~0.1 units |
 | Reprojection Error | 2.8 px | 3.2 px | 3.1 px |
 | Loop Cameras Overlap | No | Yes | Yes |
 
